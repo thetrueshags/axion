@@ -1,0 +1,52 @@
+[package]
+name = "axion-node"
+version = "0.1.0"
+edition = "2021"
+authors = ["Axion Research Labs"]
+
+[[bin]]
+name = "axion"
+path = "src/main.rs"
+
+[workspace]
+members = [ "crates/axion-core", "crates/axion-crypto", "crates/axion-net" ]
+resolver = "2"
+
+[workspace.dependencies]
+axion-core = { path = "crates/axion-core" }
+axion-crypto = { path = "crates/axion-crypto" }
+axion-net = { path = "crates/axion-net" }
+
+tokio = { version = "1.36", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+hex = "0.4"
+anyhow = "1.0"
+sled = "0.34"
+
+# Cryptography
+pqcrypto-dilithium = "0.5"
+pqcrypto-falcon = "0.3"
+pqcrypto-traits = "0.3.5"
+sha3 = "0.10"
+
+# Networking
+libp2p = { version = "0.53", features = ["tcp", "dns", "tokio", "gossipsub", "noise", "yamux", "mdns", "macros"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[dependencies]
+axion-core = { workspace = true }
+axion-crypto = { workspace = true }
+axion-net = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+sled = { workspace = true }
+warp = "0.3"
+bytes = "1.0"

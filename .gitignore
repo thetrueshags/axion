@@ -1,0 +1,16 @@
+/target
+Cargo.lock
+/axion_db
+/db_A
+/db_B
+/db_api
+*.db
+*.sled
+secrets.env
+*.key
+*.pem
+.vscode/
+.idea/
+.DS_Store
+*.log
+*.tmp

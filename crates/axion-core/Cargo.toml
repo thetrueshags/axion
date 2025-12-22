@@ -1,0 +1,12 @@
+[package]
+name = "axion-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+bincode = { workspace = true }
+sha3 = { workspace = true }
+hex = { workspace = true }
+sled = { workspace = true }
+axion-crypto = { path = "../axion-crypto" }
