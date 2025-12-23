@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Axion | Mesh Explorer</title>
+    <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background-color: #020617; color: #f8fafc; overflow: hidden; }
+        #mynetwork { height: calc(100vh - 100px); background: radial-gradient(circle, #0f172a 0%, #020617 100%); }
+        .inspector-panel { background: rgba(15, 23, 42, 0.9); backdrop-filter: blur(10px); }
+    </style>
+</head>
+<body class="h-screen flex flex-col">
+
+    <nav class="p-4 border-b border-slate-800 flex justify-between items-center bg-slate-900/50">
+        <div class="flex items-center gap-4">
+            <h1 class="text-xl font-bold tracking-tighter text-sky-400">AXION_MANTLE</h1>
+            <div id="mesh-status" class="text-xs px-2 py-1 rounded bg-green-500/20 text-green-400 border border-green-500/30">SYNCED</div>
+        </div>
+        <div class="flex gap-4">
+            <input id="search-box" type="text" placeholder="Search Hash or DID..." class="bg-slate-950 border border-slate-800 rounded px-4 py-1 text-sm w-80 focus:outline-none focus:border-sky-500">
+            <button onclick="refreshData()" class="bg-sky-600 hover:bg-sky-500 px-4 py-1 rounded text-sm font-bold">RE-SCAN</button>
+        </div>
+    </nav>
+
+    <div class="flex flex-1 relative">
+        <div id="mynetwork" class="flex-1"></div>
+
+        <div id="inspector" class="w-96 border-l border-slate-800 p-6 inspector-panel hidden overflow-y-auto">
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-lg font-bold">Block Details</h2>
+                <button onclick="closeInspector()" class="text-slate-500">✕</button>
+            </div>
+            <div id="ins-content" class="space-y-6">
+                </div>
+        </div>
+    </div>
+
+    <footer class="h-10 border-t border-slate-800 bg-slate-900/80 flex items-center px-6 text-[10px] text-slate-500 gap-8">
+        <div>TOTAL_BLOCKS: <span id="stat-blocks" class="text-slate-300">-</span></div>
+        <div>PEERS: <span id="stat-peers" class="text-slate-300">-</span></div>
+        <div>CAS_LOAD: <span id="stat-cas" class="text-slate-300">-</span></div>
+        <div class="ml-auto">LOCAL_DID: <span id="my-did" class="text-sky-500">-</span></div>
+    </footer>
+
+    <script>
+        const API_URL = "http://127.0.0.1:3030";
+        let nodes = new vis.DataSet([]);
+        let edges = new vis.DataSet([]);
+        let network = null;
+
+        function initVis() {
+            const container = document.getElementById('mynetwork');
+            const data = { nodes, edges };
+            const options = {
+                nodes: {
+                    shape: 'dot',
+                    font: { size: 12, color: '#94a3b8', face: 'monospace' },
+                    borderWidth: 2,
+                    shadow: true
+                },
+                edges: {
+                    arrows: 'to',
+                    color: { color: '#1e293b', highlight: '#38bdf8' },
+                    smooth: { type: 'cubicBezier', forceDirection: 'horizontal' }
+                },
+                physics: {
+                    enabled: true,
+                    hierarchicalRepulsion: { nodeDistance: 150 },
+                    solver: 'hierarchicalRepulsion'
+                }
+            };
+            network = new vis.Network(container, data, options);
+
+            network.on("click", function (params) {
+                if (params.nodes.length > 0) {
+                    inspectBlock(params.nodes[0]);
+                }
+            });
+        }
+
+        async function inspectBlock(hash) {
+            const res = await fetch(`${API_URL}/query/${hash}`);
+            const block = await res.json();
+            const panel = document.getElementById('inspector');
+            const content = document.getElementById('ins-content');
+
+            panel.classList.remove('hidden');
+
+            content.innerHTML = `
+                <div class="space-y-4">
+                    <section>
+                        <label class="text-[10px] uppercase text-slate-500">Index & Timestamp</label>
+                        <div class="text-sm font-bold">#${block.index} — ${new Date(block.timestamp * 1000).toLocaleString()}</div>
+                    </section>
+                    <section>
+                        <label class="text-[10px] uppercase text-slate-500">Hash</label>
+                        <div class="text-[10px] break-all text-sky-400 font-mono bg-slate-950 p-2 rounded">${block.hash}</div>
+                    </section>
+                    <section>
+                        <label class="text-[10px] uppercase text-slate-500">Author DID</label>
+                        <div class="text-xs font-mono text-purple-400">${block.author_did}</div>
+                    </section>
+                    <section class="p-4 bg-slate-950 rounded border border-slate-800">
+                        <label class="text-[10px] uppercase text-slate-500">Payload Data</label>
+                        <pre class="text-xs mt-2 text-slate-300 overflow-x-auto">${JSON.stringify(block.payload, null, 2)}</pre>
+                    </section>
+                </div>
+            `;
+        }
+
+        function closeInspector() {
+            document.getElementById('inspector').classList.add('hidden');
+        }
+
+        async function refreshData() {
+            try {
+                const [statsRes, blocksRes] = await Promise.all([
+                    fetch(`${API_URL}/api/stats`),
+                    fetch(`${API_URL}/api/blocks`)
+                ]);
+
+                const stats = await statsRes.json();
+                const blocks = await blocksRes.json();
+
+                // Update Stats Bar
+                document.getElementById('stat-blocks').innerText = stats.block_height;
+                document.getElementById('stat-peers').innerText = stats.known_peers;
+                document.getElementById('stat-cas').innerText = stats.cas_objects;
+                document.getElementById('my-did').innerText = stats.node_did;
+
+                // Update Graph
+                blocks.forEach(b => {
+                    if (!nodes.get(b.hash)) {
+                        nodes.add({
+                            id: b.hash,
+                            label: `B${b.index}`,
+                            color: b.index === 0 ? '#fbbf24' : '#0ea5e9',
+                            size: 10 + (Math.random() * 5) // In prod, scale with Reputation
+                        });
+                    }
+                    b.parent_hashes.forEach(p => {
+                        const edgeId = `${b.hash}-${p}`;
+                        if (p !== "0000000000000000000000000000000000000000000000000000000000000000" && !edges.get(edgeId)) {
+                            edges.add({ id: edgeId, from: b.hash, to: p });
+                        }
+                    });
+                });
+            } catch (e) {
+                console.error("Fetch failed", e);
+            }
+        }
+
+        initVis();
+        refreshData();
+        setInterval(refreshData, 3000);
+    </script>
+</body>
+</html>

@@ -1,15 +1,21 @@
 [package]
 name = "axion-crypto"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 
 [dependencies]
-# Inherit versions from the root workspace
+# Inherit core utilities from the root workspace
 serde = { workspace = true, features = ["derive"] }
 sha3 = { workspace = true }
-hex = "0.4"
+hex = { workspace = true }
+anyhow = { workspace = true }
+rand = { workspace = true }
 
-# PQC Libraries
+# PQC Libraries (Inherited from root Cargo.toml)
 pqcrypto-dilithium = { workspace = true }
 pqcrypto-falcon = { workspace = true }
+pqcrypto-kyber = { workspace = true }
 pqcrypto-traits = { workspace = true }
+
+# Symmetric Encryption for Hybrid PQC
+aes-gcm = { workspace = true }

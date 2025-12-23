@@ -1,0 +1,4 @@
+node_name = "Axion-Node"
+rpc_port = 3030
+db_path = "./axion_db"
+bootstrap_peers = []

@@ -1,12 +1,13 @@
 [package]
 name = "axion-net"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 
 [dependencies]
-tokio = { workspace = true, features = ["full"] }
-libp2p = { workspace = true, features = ["tcp", "dns", "tokio", "gossipsub", "noise", "yamux", "mdns", "macros"] }
-serde = { workspace = true }
+axion-core = { workspace = true }
+libp2p = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
 bincode = { workspace = true }
+serde = { workspace = true }
 tracing = { workspace = true }
-axion-core = { path = "../axion-core" }
