@@ -1,12 +1,13 @@
-
 # Axion: The Quantum-Safe Data Mesh
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Status](https://img.shields.io/badge/status-v0.1--dev-green.svg)
+![Status](https://img.shields.io/badge/status-v1.1--production-green.svg)
 ![Consensus](https://img.shields.io/badge/consensus-Reputation%20DAG-orange.svg)
 ![Cryptography](https://img.shields.io/badge/crypto-Dilithium5%20%2F%20Kyber1024-red.svg)
 
-**Axion** is a decentralized, post-quantum Layer 1 network designed for secure data availability, sovereign identity, and censorship-resistant communication. It replaces the "pay-to-play" gas model with a **Proof of Utility** reputation system, creating a neutral substrate for the next generation of resilient applications.
+**Axion** is a decentralized, post-quantum Layer 1 network designed for secure data availability, sovereign identity, and censorship-resistant communication.
+
+Unlike traditional blockchains that function like a "stock market" for blockspace (where you pay high fees to transact), Axion functions like a **digital immune system**. It replaces the "pay-to-play" gas model with a **Proof of Utility** reputation system, creating a neutral, resilient substrate for the next generation of applications.
 
 ---
 
@@ -34,24 +35,30 @@
 ## 1. The Whitepaper
 
 ### 1.1 The Post-Quantum Necessity
-The cryptographic primitives underpinning the modern web and blockchain ecosystem (RSA, ECDSA, BLS) are vulnerable to Shor's Algorithm. A sufficiently powerful quantum computer will eventually break these schemes, rendering traditional immutable ledgers insecure.
+The cryptographic primitives that currently secure the entire internet and blockchain ecosystem (RSA, ECDSA, BLS) rely on a specific math problem: *factoring large numbers is hard*. However, this is only true for classical computers.
 
-**The "Harvest Now, Decrypt Later" Threat:** Adversaries are currently scraping encrypted traffic and blockchain history. Once quantum capability is achieved, this historical data—financial records, private keys, and sensitive IP—will be retroactively exposed.
+A **Quantum Computer** running Shor's Algorithm will solve these problems almost instantly. This is not a "if" but a "when."
 
-**Axion is Quantum-Safe from Genesis.** It exclusively uses NIST-standardized Post-Quantum Cryptography (PQC) for all operations:
-* **Signatures:** ML-DSA (Dilithium5) - Ensures non-repudiation and integrity.
-* **Encryption:** ML-KEM (Kyber-1024) - Ensures privacy and secure key exchange.
+**The "Harvest Now, Decrypt Later" Threat:** Adversaries are currently scraping encrypted traffic, financial records, and blockchain history. They store this encrypted data in massive data centers. Once a sufficiently powerful quantum computer comes online, they will retroactively decrypt *everything*—your past messages, your private keys, and your intellectual property.
+
+**Axion is Quantum-Safe from Genesis.** We do not use "patches" or "upgrades." We exclusively use NIST-standardized Post-Quantum Cryptography (PQC) for all operations:
+* **Signatures (Identity):** ML-DSA (Dilithium5) — Ensures that when you sign a transaction, it is mathematically impossible to forge, even with a quantum computer.
+* **Encryption (Privacy):** ML-KEM (Kyber-1024) — Ensures that data sent between nodes cannot be read by anyone but the intended recipient.
+
+
 
 ### 1.2 The Economic Flaw of "Gas"
-Legacy blockchains treat blockspace as a scarce commodity auctioned to the highest bidder. This creates a "Fee Market" that:
-1.  **Excludes Utility:** High fees price out non-financial use cases (e.g., identity verification, supply chain tracking).
-2.  **Centralizes Power:** Wealthy actors dominate the network.
+Legacy blockchains (like Bitcoin or Ethereum) treat "blockspace" (the ability to write data to the ledger) as a scarce commodity to be auctioned off.
+* **The Bidding War:** To get your transaction processed, you must outbid others.
+* **The Consequence:** This creates a "Fee Market" that prices out regular utility. You cannot build a decentralized chat app or supply chain tracker if every message costs $5.00 to send.
+* **Centralization:** Only wealthy actors can afford to use the network during congestion.
 
 ### 1.3 Solution: Identity-Weighted Consensus
-Axion removes the native token and replaces gas fees with **Reputation Weight ($RW$)**.
-* **Proof of Utility:** Nodes earn $RW$ by performing useful work—validating blocks, storing data, and propagating state via GossipSub.
-* **The Circular Economy:** To use the network, you must contribute to the network. This mirrors the incentives of BitTorrent rather than a stock market.
-* **Canonical Spine:** The network reaches consensus via a GHOST-DAG protocol weighted by reputation, ensuring a deterministic ordering of events without a central leader.
+Axion removes the native token completely. There is no coin to pump, dump, or speculate on. Instead, we use **Reputation Weight ($RW$)**.
+
+* **Proof of Utility:** Nodes earn $RW$ by performing useful work for the network—validating blocks, storing data files, and relaying messages.
+* **The Circular Economy:** To use the network, you must contribute to the network. This mirrors the incentives of **BitTorrent**: if you seed (share) files, your download speed increases.
+* **Canonical Spine:** Instead of a single-file line (Blockchain), Axion uses a **DAG (Directed Acyclic Graph)**. Imagine a braided rope or a web where multiple blocks can be added simultaneously. The network reaches consensus on the order of events by following the path with the highest total Reputation.
 
 
 
@@ -61,27 +68,26 @@ Axion removes the native token and replaces gas fees with **Reputation Weight ($
 
 ### 2.1 Hybrid Cryptography
 Axion implements a dual-key system for every identity (DID):
-1.  **Signing Key (Dilithium5):** Used to authorize transactions and sign blocks.
-2.  **Encryption Key (Kyber-1024):** Used to create a shared secret for secure data transmission.
+1.  **The Signet Ring (Signing Key - Dilithium5):** You use this to stamp documents. It proves *you* authorized an action. It guarantees integrity and non-repudiation.
+2.  **The Safe Box (Encryption Key - Kyber-1024):** You give copies of this box to people who want to send you secrets. Only you have the key to open it. This guarantees privacy.
 
 
 
 ### 2.2 Content-Addressable Storage (CAS)
-Axion separates the "Spine" (Consensus) from the "Meat" (Data).
-* **The Spine:** Lightweight block headers containing metadata, signatures, and hashes.
-* **The Meat:** The actual data blobs are stored in a Content-Addressable Storage (CAS) layer.
-* **Deduplication:** If two users publish the exact same file, Axion stores it only once, referencing it by its SHA3-256 hash.
+Axion solves the "bloat" problem of blockchains by separating the **"Spine"** from the **"Meat"**.
 
-
+* **The Spine (Consensus):** These are lightweight Block Headers. They contain metadata (who sent it, when, signatures). They are very small and fast to sync.
+* **The Meat (Storage):** The actual data (images, code, documents) is stored in a Content-Addressable Storage layer.
+* **Deduplication:** If User A uploads a file, and User B uploads the exact same file, Axion realizes they are identical mathematically. It stores the file only once but gives both users a reference to it.
 
 ### 2.3 Data Access Control
-Unlike "public-only" blockchains, Axion supports granular access control at the protocol layer via **Hybrid Encryption** (Kyber KEM + AES-256-GCM).
+Unlike "public-only" blockchains where everything is visible to everyone, Axion supports granular access control at the protocol layer via **Hybrid Encryption** (Kyber KEM + AES-256-GCM).
 
 | Data Type | Visibility | Mechanism |
 | :--- | :--- | :--- |
-| **Public** | Everyone | Stored as verified plaintext. |
-| **Private** | 1-to-1 | Encrypted with recipient's Kyber Key. |
-| **Group** | 1-to-Many | Data encrypted once; "Unlock Key" encrypted for each member. |
+| **Public** | Everyone | Stored as verified plaintext. Any node can serve it. |
+| **Private** | 1-to-1 | Encrypted with the recipient's Kyber Key. Only they can decrypt the blob. |
+| **Group** | 1-to-Many | Data is encrypted once with a symmetric key; that symmetric key is then encrypted individually for each group member. |
 
 ---
 
@@ -91,7 +97,7 @@ Unlike "public-only" blockchains, Axion supports granular access control at the 
 Ensure you have Rust (v1.75+) installed.
 
 ```bash
-git clone [https://github.com/thetrueshags/axion.git](https://github.com/thetrueshags/axion.git)
+git clone https://github.com/axion-foundation/axion-network.git
 cd axion
 cargo build --release
 
@@ -99,9 +105,10 @@ cargo build --release
 
 ### 3.2 Running a Node (CLI)
 
-Axion v0.1 features a CLI for node management.
+Axion v1.1 features a robust CLI for node management.
 
 **1. Initialize a new Node (Mint Identity):**
+This generates your quantum-safe keys and solves a Proof-of-Work puzzle to prevent spam identities.
 
 ```bash
 ./target/release/axion init
@@ -110,6 +117,7 @@ Axion v0.1 features a CLI for node management.
 ```
 
 **2. Start the Node:**
+Connect to the peer-to-peer mesh and begin syncing the DAG.
 
 ```bash
 ./target/release/axion start
@@ -131,7 +139,7 @@ Every Axion node comes with a built-in visualization dashboard.
 Once your node is running, open your browser to:
 **`http://127.0.0.1:3030/ui`**
 
-This provides a real-time view of the DAG, peer connectivity, and data inspection.
+This provides a real-time view of the DAG structure, your connected peers, and allows you to inspect data payloads.
 
 ---
 
@@ -141,7 +149,7 @@ Axion exposes a REST/JSON interface for developers to build sovereign applicatio
 
 ### 4.1 Announce Identity
 
-Before receiving private data, a node must publish its **Kyber Encryption Key** to the network.
+Before receiving private data, a node must publish its **Kyber Encryption Key** to the network so others know how to message it securely.
 
 ```bash
 curl -X POST [http://127.0.0.1:3030/announce_key](http://127.0.0.1:3030/announce_key)
@@ -167,7 +175,7 @@ curl -X POST [http://127.0.0.1:3030/publish](http://127.0.0.1:3030/publish) \
 
 ### 4.3 Query Data
 
-Retrieve a block and its payload by hash. If the data is locally available in CAS, it will be returned.
+Retrieve a block and its payload by hash. If the data is locally available in your CAS, it will be returned instantly. If not, your node will attempt to fetch it from the mesh.
 
 ```bash
 curl [http://127.0.0.1:3030/query/](http://127.0.0.1:3030/query/)<BLOCK_HASH>

@@ -1,14 +1,15 @@
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use tokio::sync::mpsc;
 use tracing_subscriber::FmtSubscriber;
 use warp::Filter;
-use warp::http::Method; // Required for CORS
+use warp::http::Method;
 use anyhow::{Result, Context, anyhow};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+use libp2p::PeerId;
 
 // Crate Imports
 use axion_core::{AxionBlock, BlockPayload, GlobalState, AccessPolicy};
@@ -27,21 +28,40 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Start the full node (P2P + RPC)
     Start,
+    /// Initialize a new node and identity
     Init,
+    /// Import an identity file
     ImportIdentity {
         #[arg(short, long)]
         path: String,
     },
+    /// Export the current identity
     ExportIdentity {
         #[arg(short, long)]
         output: String,
     },
+    /// Show node status
     Info,
+    /// Clean up old data
     Prune {
         #[arg(long, default_value_t = 2592000)]
         retention: u64,
     },
+    /// Manually trigger a synchronization request to a specific peer
+    Sync {
+        #[arg(long)]
+        peer_id: String,
+    },
+    /// Audit a node for data withholding and generate a Fraud Proof
+    Audit {
+        #[arg(long)]
+        target_did: String,
+        #[arg(long)]
+        target_hash: String,
+    },
+    /// Wipe the database
     Reset,
 }
 
@@ -74,6 +94,8 @@ struct NodeContext {
     did: String,
     sign_keys: Keypair,
     enc_keys: EncryptionKeypair,
+    // We add the sync transmitter to the context so the API can trigger syncs if needed later
+    sync_req_tx: mpsc::Sender<PeerId>,
 }
 
 // --- 4. IDENTITY STRUCTURE (Disk Format) ---
@@ -104,6 +126,8 @@ async fn main() -> Result<()> {
         Commands::ExportIdentity { output } => handle_export(output),
         Commands::Info => handle_info(),
         Commands::Prune { retention } => handle_prune(*retention),
+        Commands::Sync { peer_id } => handle_sync_cli(peer_id).await,
+        Commands::Audit { target_did, target_hash } => handle_audit(target_did, target_hash).await,
         Commands::Reset => handle_reset(),
     }
 }
@@ -153,6 +177,7 @@ async fn handle_start() -> Result<()> {
 
     let state = Arc::new(GlobalState::load(&config.db_path)?);
 
+    // Auto-Genesis
     if state.get_canonical_head()?.is_empty() {
         println!("✨ Fresh Database detected. Applying Local Genesis...");
         let genesis = create_block(
@@ -165,32 +190,36 @@ async fn handle_start() -> Result<()> {
         state.apply_genesis(&genesis)?;
     }
 
-    let (cmd_tx, cmd_rx) = mpsc::channel(32);
-    let (event_tx, mut event_rx) = mpsc::channel(32);
+    // --- CHANNEL SETUP ---
+    let (cmd_tx, cmd_rx) = mpsc::channel(32);            // Outbound Blocks (RPC -> P2P)
+    let (event_tx, mut event_rx) = mpsc::channel(32);    // Inbound Blocks (P2P -> Main)
+    let (sync_req_tx, sync_req_rx) = mpsc::channel(32);  // Sync Requests (RPC/Main -> P2P)
 
+    // --- NETWORK ENGINE ---
     let bootstrap = config.bootstrap_peers.first().cloned();
 
-    if bootstrap.is_some() {
-        println!("🔗 Connecting to DHT Bootstrap Peer...");
-    } else {
-        println!("📡 Running as standalone/seed. Waiting for mDNS peers...");
-    }
-
-    let p2p = AxionP2P::new("axion-mainnet", cmd_rx, event_tx, bootstrap)
-        .await
-        .map_err(|e| anyhow!("P2P Layer Failed: {}", e))?;
+    // Injecting State into P2P layer so it can answer historical requests
+    let mut p2p = AxionP2P::new(
+        "axion-mainnet",
+        cmd_rx,
+        event_tx,
+        sync_req_rx,
+        bootstrap,
+        state.clone()
+    ).await.map_err(|e| anyhow!("P2P Layer Failed: {}", e))?;
 
     tokio::spawn(async move {
-        let mut active_p2p = p2p;
-        active_p2p.run().await;
+        p2p.run().await;
     });
 
+    // --- RPC API ---
     let ctx = Arc::new(NodeContext {
         state: state.clone(),
-        cmd_tx,
+        cmd_tx: cmd_tx.clone(),
         did: did.clone(),
         sign_keys: sign_keys.clone(),
         enc_keys: enc_keys.clone(),
+        sync_req_tx: sync_req_tx.clone(),
     });
 
     let rpc_routes = build_routes(ctx);
@@ -202,12 +231,17 @@ async fn handle_start() -> Result<()> {
     });
 
     println!("🟢 Node Online. Joining the Blob...");
+    println!("⏳ Waiting for peers...");
 
+    // Main Consensus Loop
     while let Some(block) = event_rx.recv().await {
         if block.is_valid() {
-            match state.process_block(&block) {
-                Ok(_) => println!("✅ Synced Block #{} (Hash: {}...)", block.index, &block.hash[0..8]),
-                Err(e) => eprintln!("❌ Block Rejection: {}", e),
+            // Check if we already have it to avoid spamming logs
+            if state.get_block(&block.hash)?.is_none() {
+                match state.process_block(&block) {
+                    Ok(_) => println!("✅ Synced Block #{} (Hash: {}...)", block.index, &block.hash[0..8]),
+                    Err(e) => eprintln!("❌ Block Rejection: {}", e),
+                }
             }
         } else {
             eprintln!("⚠️  Dropped Invalid Block (Bad Signature/Hash)");
@@ -216,16 +250,64 @@ async fn handle_start() -> Result<()> {
     Ok(())
 }
 
+async fn handle_audit(target_did: &String, target_hash: &String) -> Result<()> {
+    println!("🕵️ AUDIT: Investigating node {} for hash {}...", target_did, target_hash);
+
+    // 1. Load context
+    if !Path::new("config.toml").exists() || !Path::new("identity.json").exists() {
+        return Err(anyhow!("Node not initialized."));
+    }
+    let config: NodeConfig = toml::from_str(&fs::read_to_string("config.toml")?)?;
+    let (sign_keys, _, did) = load_or_create_identity("identity.json")?;
+    let state = GlobalState::load(&config.db_path)?;
+
+    // 2. Check Local
+    if state.get_block(target_hash)?.is_some() {
+        println!("✅ Audit Passed: Data is available locally.");
+        return Ok(());
+    }
+
+    println!("⚠️ CONFIRM: You are accusing {} of withholding data.", target_did);
+    println!("Creating Fraud Proof...");
+
+    // 3. Create Fraud Proof
+    // In v1.1 CLI, we sign it ourselves. In v1.2, we would gather signatures from peers.
+    let accuser_sig = sign_keys.sign(target_hash.as_bytes())?;
+
+    let payload = BlockPayload::FraudProof {
+        accused_did: target_did.to_string(),
+        blob_hash: target_hash.to_string(),
+        witness_votes: vec![(did.clone(), accuser_sig)],
+    };
+
+    let parent = state.get_canonical_head().unwrap_or("0".repeat(64));
+    let block = create_block(1, vec![parent], &sign_keys, &did, payload)?;
+
+    // 4. Commit locally (Will propagate on next full start)
+    state.process_block(&block)?;
+    println!("🚨 Fraud Proof Created! Hash: {}", block.hash);
+    println!("Next time you run 'start', this block will be gossiped to the mesh.");
+
+    Ok(())
+}
+
+async fn handle_sync_cli(_peer_id: &str) -> Result<()> {
+    // Note: The CLI command cannot talk to the running node's P2P layer directly via simple channel
+    // because they are different processes.
+    // In a production app, we would use the RPC client to tell the running node to sync.
+    // For v1.1, we rely on the node's auto-discovery or RPC endpoint triggers.
+    println!("❌ To trigger a sync, please use the RPC endpoint or restart the node.");
+    println!("Feature planned for RPC Client v1.2");
+    Ok(())
+}
+
 async fn handle_import(source_path: &str) -> Result<()> {
     if !Path::new(source_path).exists() {
         return Err(anyhow!("Source file not found: {}", source_path));
     }
-
-    println!("🔄 Importing identity from '{}'...", source_path);
     let data = fs::read(source_path)?;
     let _: PersistentIdentity = serde_json::from_slice(&data)
         .context("File is not a valid Axion Identity JSON")?;
-
     fs::copy(source_path, "identity.json")?;
     println!("✅ Identity Imported Successfully.");
     Ok(())
@@ -233,7 +315,7 @@ async fn handle_import(source_path: &str) -> Result<()> {
 
 fn handle_export(dest_path: &str) -> Result<()> {
     if !Path::new("identity.json").exists() {
-        return Err(anyhow!("No active identity found. Run 'axion init' first."));
+        return Err(anyhow!("No active identity found."));
     }
     fs::copy("identity.json", dest_path)?;
     println!("💾 Identity exported to '{}'", dest_path);
@@ -242,13 +324,11 @@ fn handle_export(dest_path: &str) -> Result<()> {
 
 fn handle_info() -> Result<()> {
     if !Path::new("identity.json").exists() {
-        return Err(anyhow!("Node is not initialized. Run 'axion init'."));
+        return Err(anyhow!("Node is not initialized."));
     }
     let (_, _, did) = load_or_create_identity("identity.json")?;
-
     println!("--- Axion Node Status ---");
     println!("👤 Identity (DID): {}", did);
-
     if Path::new("config.toml").exists() {
         let config: NodeConfig = toml::from_str(&fs::read_to_string("config.toml")?)?;
         println!("📂 Database Path:  {}", config.db_path);
@@ -259,17 +339,11 @@ fn handle_info() -> Result<()> {
 }
 
 fn handle_prune(retention: u64) -> Result<()> {
-    if !Path::new("config.toml").exists() {
-        return Err(anyhow!("Config not found."));
-    }
+    if !Path::new("config.toml").exists() { return Err(anyhow!("Config not found.")); }
     let config: NodeConfig = toml::from_str(&fs::read_to_string("config.toml")?)?;
-
     println!("🧹 Starting Garbage Collection...");
-    println!("📉 Pruning blocks older than {} seconds...", retention);
-
     let state = GlobalState::load(&config.db_path)?;
     let count = state.prune_stale_data(retention)?;
-
     println!("✅ Pruning Complete. Removed {} stale items.", count);
     Ok(())
 }
@@ -278,15 +352,13 @@ fn handle_reset() -> Result<()> {
     println!("⚠️  DANGER ZONE ⚠️");
     println!("This will permanently DELETE your local database and configuration.");
     println!("Type 'RESET' to confirm:");
-
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
-
     if input.trim() == "RESET" {
         println!("💥 Wiping data...");
         if Path::new("axion_db").exists() { fs::remove_dir_all("axion_db")?; }
         if Path::new("config.toml").exists() { fs::remove_file("config.toml")?; }
-        println!("✅ Reset Complete. Run 'axion init' to start fresh.");
+        println!("✅ Reset Complete.");
     } else {
         println!("❌ Cancelled.");
     }
@@ -297,7 +369,7 @@ fn handle_reset() -> Result<()> {
 
 fn build_routes(ctx: Arc<NodeContext>) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
 
-    // 1. CORS Policy
+    // 1. CORS Policy (Critical for Explorer)
     let cors = warp::cors()
         .allow_any_origin()
         .allow_methods(vec![Method::GET, Method::POST])
@@ -365,13 +437,27 @@ fn build_routes(ctx: Arc<NodeContext>) -> impl Filter<Extract = impl warp::Reply
             }
         });
 
+    // NEW: Trigger Sync Endpoint (Called by Explorer or CLI tools)
+    let sync_route = warp::path!("sync" / String)
+        .and(warp::post())
+        .map({
+             let ctx = ctx.clone();
+             move |peer_str: String| {
+                 if let Ok(peer_id) = peer_str.parse::<PeerId>() {
+                     let _ = ctx.sync_req_tx.try_send(peer_id);
+                     warp::reply::json(&"Sync Requested")
+                 } else {
+                     warp::reply::json(&"Invalid Peer ID")
+                 }
+             }
+        });
+
     let state_route = warp::path("state")
         .and(warp::get())
         .map(|| {
             warp::reply::json(&"Node is Active.")
         });
 
-    // NEW: API for Explorer - Recent Blocks
     let blocks_route = warp::path!("api" / "blocks")
         .and(warp::get())
         .map({
@@ -382,7 +468,6 @@ fn build_routes(ctx: Arc<NodeContext>) -> impl Filter<Extract = impl warp::Reply
             }
         });
 
-    // NEW: API for Explorer - Stats
     let stats_route = warp::path!("api" / "stats")
         .and(warp::get())
         .map({
@@ -398,14 +483,13 @@ fn build_routes(ctx: Arc<NodeContext>) -> impl Filter<Extract = impl warp::Reply
             }
         });
 
-    // NEW: Serve Explorer UI
-    // Access at http://localhost:3030/ui
     let ui_route = warp::path("ui")
         .and(warp::fs::file("explorer.html"));
 
     announce_route
         .or(publish_route)
         .or(query_route)
+        .or(sync_route)
         .or(state_route)
         .or(blocks_route)
         .or(stats_route)

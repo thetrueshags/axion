@@ -3,18 +3,17 @@ use axion_crypto::{verify_signature, PublicKey};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 use sled::Tree;
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// --- 1. ACCESS CONTROL ---
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum AccessPolicy {
     Public,
     Private { recipient: String },
     Group { members: Vec<String> },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum BlockPayload {
     Genesis {
         message: String,
@@ -22,17 +21,20 @@ pub enum BlockPayload {
     DataStore {
         policy: AccessPolicy,
         blob: Vec<u8>,
-        keys: std::collections::HashMap<String, (Vec<u8>, Vec<u8>)>,
+        keys: HashMap<String, (Vec<u8>, Vec<u8>)>,
     },
     IdentityUpdate {
         did: String,
         new_encryption_key: Vec<u8>,
     },
+    FraudProof {
+        accused_did: String,
+        blob_hash: String,
+        witness_votes: Vec<(String, Vec<u8>)>,
+    },
 }
 
-// --- 2. BLOCK STRUCTURE (Wire/Consensus Format) ---
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AxionBlock {
     pub index: u64,
     pub timestamp: u64,
@@ -96,15 +98,11 @@ impl AxionBlock {
     }
 }
 
-// --- 3. STORAGE STRUCTURES (Disk Format) ---
-
 #[derive(Serialize, Deserialize)]
 struct StoredBlock {
     block: AxionBlock,
     blob_hash: Option<String>,
 }
-
-// --- 4. STATE MACHINE ---
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ValidatorState {
@@ -119,7 +117,7 @@ pub struct GlobalState {
     validators: Tree,
     metadata: Tree,
     cas: Tree,
-    heights: Tree, // NEW: Index by Height for Explorer
+    heights: Tree,
 }
 
 impl GlobalState {
@@ -132,7 +130,7 @@ impl GlobalState {
             validators: db.open_tree("validators")?,
             metadata: db.open_tree("metadata")?,
             cas: db.open_tree("cas")?,
-            heights: db.open_tree("heights")?, // Initialize new tree
+            heights: db.open_tree("heights")?,
         })
     }
 
@@ -141,6 +139,21 @@ impl GlobalState {
             Some(b) => Ok(Some(bincode::deserialize::<ValidatorState>(&b)?)),
             None => Ok(None),
         }
+    }
+
+    pub fn get_top_validators(&self, count: usize) -> Result<Vec<(String, ValidatorState)>> {
+        let mut validators = Vec::new();
+        for item in self.validators.iter() {
+            let (did_bytes, val_bytes) = item?;
+            let did = String::from_utf8(did_bytes.to_vec())?;
+            let val: ValidatorState = bincode::deserialize(&val_bytes)?;
+            validators.push((did, val));
+        }
+
+        validators.sort_by(|a, b| b.1.reputation.cmp(&a.1.reputation));
+        validators.truncate(count);
+
+        Ok(validators)
     }
 
     pub fn apply_genesis(&self, block: &AxionBlock) -> Result<()> {
@@ -158,6 +171,10 @@ impl GlobalState {
         self.save_validator(&block.author_did, val)?;
         self.metadata
             .insert("genesis_hash", block.hash.as_bytes())?;
+
+        self.blocks.flush()?;
+        self.heights.flush()?;
+
         Ok(())
     }
 
@@ -178,11 +195,40 @@ impl GlobalState {
         val.reputation += 10;
         val.last_seen = block.timestamp;
 
-        if let BlockPayload::IdentityUpdate {
-            new_encryption_key, ..
-        } = &block.payload
-        {
-            val.encryption_key = new_encryption_key.clone();
+        match &block.payload {
+            BlockPayload::IdentityUpdate {
+                new_encryption_key, ..
+            } => {
+                val.encryption_key = new_encryption_key.clone();
+            }
+            BlockPayload::FraudProof {
+                accused_did,
+                witness_votes,
+                ..
+            } => {
+                let jury = self.get_top_validators(10)?;
+                let jury_dids: Vec<&String> = jury.iter().map(|(d, _)| d).collect();
+
+                let mut valid_votes = 0;
+                for (witness_did, _sig) in witness_votes {
+                    if jury_dids.contains(&witness_did) {
+                        valid_votes += 1;
+                    }
+                }
+
+                if valid_votes >= 2 {
+                    if let Some(mut bad_actor) = self.get_validator(accused_did)? {
+                        println!(
+                            "⚖️ JUSTICE: Slashing DID {} for Data Withholding!",
+                            accused_did
+                        );
+                        bad_actor.reputation /= 2;
+                        self.save_validator(accused_did, bad_actor)?;
+                        val.reputation += 500;
+                    }
+                }
+            }
+            _ => {}
         }
 
         self.save_validator(&block.author_did, val)?;
@@ -190,10 +236,7 @@ impl GlobalState {
         Ok(())
     }
 
-    // --- TRUE CAS IMPLEMENTATION ---
-
     fn save_block_internal(&self, block: &AxionBlock) -> Result<()> {
-        // 1. CAS Deduplication (Unchanged)
         let mut skeleton_block = block.clone();
         let mut extracted_hash = None;
         if let BlockPayload::DataStore { blob, .. } = &mut skeleton_block.payload {
@@ -207,7 +250,6 @@ impl GlobalState {
             }
         }
 
-        // 2. Save the Block to the main 'blocks' tree
         let storage_unit = StoredBlock {
             block: skeleton_block,
             blob_hash: extracted_hash,
@@ -215,11 +257,7 @@ impl GlobalState {
         let bytes = bincode::serialize(&storage_unit)?;
         self.blocks.insert(&block.hash, bytes)?;
 
-        // 3. HARDENED Height Indexing
-        // Ensure we are using Big Endian for the key so Sled sorts properly
         let height_key = block.index.to_be_bytes();
-
-        // Retrieve existing list or create new
         let mut hashes_at_height: Vec<String> = match self.heights.get(&height_key)? {
             Some(data) => bincode::deserialize(&data).unwrap_or_default(),
             None => Vec::new(),
@@ -231,7 +269,6 @@ impl GlobalState {
                 .insert(&height_key, bincode::serialize(&hashes_at_height)?)?;
         }
 
-        // CRITICAL: Flush to disk to ensure persistence across restarts
         self.blocks.flush()?;
         self.heights.flush()?;
         self.cas.flush()?;
@@ -263,13 +300,29 @@ impl GlobalState {
         }
     }
 
-    // --- EXPLORER HELPERS ---
+    pub fn get_blocks_range(&self, start_index: u64, limit: usize) -> Result<Vec<AxionBlock>> {
+        let start_key = start_index.to_be_bytes();
+        let mut result = Vec::new();
 
-    /// Returns the last N blocks (latest first)
+        for item in self.heights.range(start_key..) {
+            let (_, value) = item?;
+            let hashes: Vec<String> = bincode::deserialize(&value)?;
+
+            for hash in hashes {
+                if let Some(block) = self.get_block(&hash)? {
+                    result.push(block);
+                    if result.len() >= limit {
+                        return Ok(result);
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
     pub fn get_recent_blocks(&self, limit: usize) -> Result<Vec<AxionBlock>> {
         let mut result = Vec::new();
 
-        // Iterate backwards from the end of the heights tree
         for item in self.heights.iter().rev() {
             let (_, value) = item?;
             let hashes: Vec<String> = bincode::deserialize(&value)?;
@@ -286,7 +339,6 @@ impl GlobalState {
         Ok(result)
     }
 
-    /// Returns basic stats for the dashboard
     pub fn get_stats(&self) -> Result<(usize, usize, usize)> {
         let block_count = self.blocks.len();
         let peer_count = self.validators.len();
@@ -294,7 +346,6 @@ impl GlobalState {
         Ok((block_count, peer_count, cas_items))
     }
 
-    // --- PRUNING (Garbage Collection) ---
     pub fn prune_stale_data(&self, retention_seconds: u64) -> Result<usize> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let cutoff = now.saturating_sub(retention_seconds);
@@ -303,17 +354,11 @@ impl GlobalState {
         for item in self.blocks.iter() {
             let (key, value) = item?;
             if let Ok(storage_unit) = bincode::deserialize::<StoredBlock>(&value) {
-                // Never delete Genesis (Index 0)
                 if storage_unit.block.index != 0 && storage_unit.block.timestamp < cutoff {
-                    // 1. Delete the Block Reference
                     self.blocks.remove(&key)?;
-
-                    // 2. Delete the Blob from CAS if it exists
                     if let Some(blob_hash) = storage_unit.blob_hash {
                         self.cas.remove(blob_hash)?;
                     }
-
-                    // 3. Clean up Heights Index (Optional but good practice)
                     let height_key = storage_unit.block.index.to_be_bytes();
                     self.heights.remove(height_key)?;
 
