@@ -153,7 +153,7 @@ impl GlobalState {
             let (did_bytes, val_bytes) = item?;
             let did = String::from_utf8(did_bytes.to_vec())?;
             if let Ok(state) = bincode::deserialize::<ValidatorState>(&val_bytes) {
-                 validators.push(ValidatorSummary { did, state });
+                validators.push(ValidatorSummary { did, state });
             }
         }
         Ok(validators)
@@ -201,7 +201,8 @@ impl GlobalState {
             return Ok(());
         }
 
-        let mut val = self
+        // 1. Load the Block Author (The Node) to update their reputation/heartbeat
+        let mut author_val = self
             .get_validator(&block.author_did)?
             .unwrap_or(ValidatorState {
                 reputation: 0,
@@ -210,15 +211,29 @@ impl GlobalState {
                 encryption_key: vec![],
             });
 
-        val.last_seen = block.timestamp;
-
-        val.reputation += 10;
+        author_val.reputation += 10;
+        author_val.last_seen = block.timestamp;
 
         match &block.payload {
             BlockPayload::IdentityUpdate {
-                new_encryption_key, ..
+                did: target_did,
+                new_encryption_key,
             } => {
-                val.encryption_key = new_encryption_key.clone();
+                let mut target_val = self.get_validator(target_did)?.unwrap_or(ValidatorState {
+                    reputation: 50,
+                    last_seen: block.timestamp,
+                    signing_key: vec![],
+                    encryption_key: vec![],
+                });
+
+                target_val.encryption_key = new_encryption_key.clone();
+                target_val.last_seen = block.timestamp;
+
+                self.save_validator(target_did, target_val)?;
+                println!(
+                    "💾 [STATE] Successfully Registered External Identity: {}",
+                    target_did
+                );
             }
             BlockPayload::FraudProof {
                 accused_did,
@@ -243,15 +258,15 @@ impl GlobalState {
                         );
                         bad_actor.reputation /= 2;
                         self.save_validator(accused_did, bad_actor)?;
-                        val.reputation += 500;
+                        author_val.reputation += 500;
                     }
                 }
             }
             _ => {}
         }
 
-        // Commit updates to DB
-        self.save_validator(&block.author_did, val)?;
+        self.save_validator(&block.author_did, author_val)?;
+
         self.save_block_internal(block)?;
         Ok(())
     }
