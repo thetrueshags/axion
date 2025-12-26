@@ -88,6 +88,12 @@ struct PersistentIdentity {
     pow: IdentityPoW,
 }
 
+#[derive(Deserialize)]
+struct AnnounceRequest {
+    did: Option<String>,
+    encryption_key: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let subscriber = FmtSubscriber::builder()
@@ -277,10 +283,6 @@ async fn handle_audit(target_did: &String, target_hash: &String) -> Result<()> {
 }
 
 async fn handle_sync_cli(_peer_id: &str) -> Result<()> {
-    // Note: The CLI command cannot talk to the running node's P2P layer directly via simple channel
-    // because they are different processes.
-    // In a production app, we would use the RPC client to tell the running node to sync.
-    // For v1.1, we rely on the node's auto-discovery or RPC endpoint triggers.
     println!("❌ To trigger a sync, please use the RPC endpoint or restart the node.");
     println!("Feature planned for RPC Client v1.2");
     Ok(())
@@ -364,17 +366,30 @@ fn build_routes(
         .allow_methods(vec![Method::GET, Method::POST])
         .allow_headers(vec!["content-type"]);
 
-    let announce_route = warp::path("announce_key").and(warp::post()).map({
-        let ctx = ctx.clone();
-        move || {
-            let payload = BlockPayload::IdentityUpdate {
-                did: ctx.did.clone(),
-                new_encryption_key: ctx.enc_keys.public.clone(),
-            };
-            submit_block(&ctx, payload);
-            warp::reply::json(&"Key Announced")
-        }
-    });
+    let announce_route = warp::path("announce_key")
+        .and(warp::post())
+        .and(warp::body::content_length_limit(1024 * 16))
+        .and(warp::body::json())
+        .map({
+            let ctx = ctx.clone();
+            move |req: AnnounceRequest| {
+                let target_did = req.did.unwrap_or(ctx.did.clone());
+                let target_key_bytes = if let Some(hex_key) = req.encryption_key {
+                    hex::decode(hex_key).unwrap_or(ctx.enc_keys.public.clone())
+                } else {
+                    ctx.enc_keys.public.clone()
+                };
+
+                let payload = BlockPayload::IdentityUpdate {
+                    did: target_did.clone(),
+                    new_encryption_key: target_key_bytes,
+                };
+
+                submit_block(&ctx, payload);
+                println!("📢 RPC: Announced Identity for {}", target_did);
+                warp::reply::json(&"Key Announced")
+            }
+        });
 
     let publish_route = warp::path("publish")
         .and(warp::post())
@@ -393,8 +408,15 @@ fn build_routes(
                         std::collections::HashMap::new(),
                     ),
                     "private" => {
-                        let recipient_did = json["recipient"].as_str().unwrap_or("");
-                        if let Ok(Some(val)) = ctx.state.get_validator(recipient_did) {
+                        let raw_recipient = json["recipient"].as_str().unwrap_or("");
+
+                        let lookup_key = if raw_recipient.starts_with("did:axion:") {
+                            raw_recipient.to_string()
+                        } else {
+                            format!("did:axion:{}", raw_recipient)
+                        };
+
+                        if let Ok(Some(val)) = ctx.state.get_validator(&lookup_key) {
                             if val.encryption_key.is_empty() {
                                 return warp::reply::json(
                                     &"Error: Recipient has no Kyber key registered",
@@ -404,16 +426,34 @@ fn build_routes(
                                 axion_crypto::hybrid_encrypt(&val.encryption_key, &data_bytes)
                                     .unwrap();
                             let mut key_map = std::collections::HashMap::new();
-                            key_map.insert(recipient_did.to_string(), (kem, nonce));
+                            key_map.insert(lookup_key.clone(), (kem, nonce));
                             (
                                 AccessPolicy::Private {
-                                    recipient: recipient_did.into(),
+                                    recipient: lookup_key.into(),
                                 },
                                 cipher,
                                 key_map,
                             )
                         } else {
-                            return warp::reply::json(&"Error: Recipient DID not found in state");
+                            let stripped = raw_recipient.replace("did:axion:", "");
+                            if let Ok(Some(val)) = ctx.state.get_validator(&stripped) {
+                                let (kem, nonce, cipher) =
+                                    axion_crypto::hybrid_encrypt(&val.encryption_key, &data_bytes)
+                                        .unwrap();
+                                let mut key_map = std::collections::HashMap::new();
+                                key_map.insert(stripped.clone(), (kem, nonce));
+                                (
+                                    AccessPolicy::Private {
+                                        recipient: stripped.into(),
+                                    },
+                                    cipher,
+                                    key_map,
+                                )
+                            } else {
+                                return warp::reply::json(
+                                    &"Error: Recipient DID not found in state",
+                                );
+                            }
                         }
                     }
                     _ => (
