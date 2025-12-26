@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing_subscriber::FmtSubscriber;
 use warp::http::Method;
@@ -368,7 +368,6 @@ fn build_routes(
 
     let announce_route = warp::path("announce_key")
         .and(warp::post())
-        .and(warp::body::content_length_limit(1024 * 16))
         .and(warp::body::json())
         .map({
             let ctx = ctx.clone();
@@ -385,9 +384,16 @@ fn build_routes(
                     new_encryption_key: target_key_bytes,
                 };
 
-                submit_block(&ctx, payload);
-                println!("📢 RPC: Announced Identity for {}", target_did);
-                warp::reply::json(&"Key Announced")
+                match submit_block_sync(&ctx, payload) {
+                    Ok(_) => {
+                        println!("📢 RPC: Identity Committed to State: {}", target_did);
+                        warp::reply::json(&"Key Announced and Committed")
+                    }
+                    Err(e) => {
+                        println!("❌ RPC: Announcement Failed: {}", e);
+                        warp::reply::json(&format!("Error: {}", e))
+                    }
+                }
             }
         });
 
@@ -401,71 +407,54 @@ fn build_routes(
                 let data_hex = json["data"].as_str().unwrap_or("");
                 let data_bytes = hex::decode(data_hex).unwrap_or_default();
 
-                let (policy, blob, keys) = match mode {
-                    "public" => (
-                        AccessPolicy::Public,
-                        data_bytes,
-                        std::collections::HashMap::new(),
-                    ),
-                    "private" => {
-                        let raw_recipient = json["recipient"].as_str().unwrap_or("");
+                if mode == "private" {
+                    let raw_recipient = json["recipient"].as_str().unwrap_or("");
 
-                        let lookup_key = if raw_recipient.starts_with("did:axion:") {
-                            raw_recipient.to_string()
-                        } else {
-                            format!("did:axion:{}", raw_recipient)
-                        };
+                    println!(
+                        "🔍 Incoming Publish Request for Recipient: '{}'",
+                        raw_recipient
+                    );
 
-                        if let Ok(Some(val)) = ctx.state.get_validator(&lookup_key) {
-                            if val.encryption_key.is_empty() {
-                                return warp::reply::json(
-                                    &"Error: Recipient has no Kyber key registered",
-                                );
-                            }
+                    if let Ok(validators) = ctx.state.get_all_validators() {
+                        println!("📋 Current State Directory ({} entries):", validators.len());
+                        for v in validators {
+                            println!("  - Known DID: '{}'", v.did);
+                        }
+                    }
+
+                    let lookup_key = if raw_recipient.starts_with("did:axion:") {
+                        raw_recipient.to_string()
+                    } else {
+                        format!("did:axion:{}", raw_recipient)
+                    };
+
+                    match ctx.state.get_validator(&lookup_key) {
+                        Ok(Some(val)) => {
+                            println!("✅ Found Match for: {}", lookup_key);
                             let (kem, nonce, cipher) =
                                 axion_crypto::hybrid_encrypt(&val.encryption_key, &data_bytes)
                                     .unwrap();
                             let mut key_map = std::collections::HashMap::new();
                             key_map.insert(lookup_key.clone(), (kem, nonce));
-                            (
-                                AccessPolicy::Private {
+
+                            let payload = BlockPayload::DataStore {
+                                policy: AccessPolicy::Private {
                                     recipient: lookup_key.into(),
                                 },
-                                cipher,
-                                key_map,
-                            )
-                        } else {
-                            let stripped = raw_recipient.replace("did:axion:", "");
-                            if let Ok(Some(val)) = ctx.state.get_validator(&stripped) {
-                                let (kem, nonce, cipher) =
-                                    axion_crypto::hybrid_encrypt(&val.encryption_key, &data_bytes)
-                                        .unwrap();
-                                let mut key_map = std::collections::HashMap::new();
-                                key_map.insert(stripped.clone(), (kem, nonce));
-                                (
-                                    AccessPolicy::Private {
-                                        recipient: stripped.into(),
-                                    },
-                                    cipher,
-                                    key_map,
-                                )
-                            } else {
-                                return warp::reply::json(
-                                    &"Error: Recipient DID not found in state",
-                                );
-                            }
+                                blob: cipher,
+                                keys: key_map,
+                            };
+                            submit_block_sync(&ctx, payload).unwrap();
+                            warp::reply::json(&"Data Published to Mesh")
+                        }
+                        _ => {
+                            println!("❌ Lookup Failed for: {}", lookup_key);
+                            warp::reply::json(&"Error: Recipient DID not found in state")
                         }
                     }
-                    _ => (
-                        AccessPolicy::Public,
-                        vec![],
-                        std::collections::HashMap::new(),
-                    ),
-                };
-
-                let payload = BlockPayload::DataStore { policy, blob, keys };
-                submit_block(&ctx, payload);
-                warp::reply::json(&"Data Published to Mesh")
+                } else {
+                    warp::reply::json(&"Public data not supported in this debug build")
+                }
             }
         });
 
@@ -553,6 +542,24 @@ fn submit_block(ctx: &NodeContext, payload: BlockPayload) {
     } else {
         eprintln!("❌ Failed to create block");
     }
+}
+
+fn submit_block_sync(ctx: &NodeContext, payload: BlockPayload) -> Result<()> {
+    let parent = ctx.state.get_canonical_head().unwrap_or("0".repeat(64));
+    let block = create_block(1, vec![parent], &ctx.sign_keys, &ctx.did, payload)?;
+
+    let tx = ctx.cmd_tx.clone();
+    let block_clone = block.clone();
+    tokio::spawn(async move {
+        let _ = tx.send(block_clone).await;
+    });
+
+    ctx.state
+        .process_block(&block)
+        .map_err(|e| anyhow!("State Write Failed: {}", e))?;
+
+    println!("💾 State Sync: Block #{} applied to local DB.", block.index);
+    Ok(())
 }
 
 fn create_block(

@@ -112,6 +112,12 @@ pub struct ValidatorState {
     pub encryption_key: Vec<u8>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ValidatorSummary {
+    pub did: String,
+    pub state: ValidatorState,
+}
+
 pub struct GlobalState {
     blocks: Tree,
     validators: Tree,
@@ -139,6 +145,18 @@ impl GlobalState {
             Some(b) => Ok(Some(bincode::deserialize::<ValidatorState>(&b)?)),
             None => Ok(None),
         }
+    }
+
+    pub fn get_all_validators(&self) -> Result<Vec<ValidatorSummary>> {
+        let mut validators = Vec::new();
+        for item in self.validators.iter() {
+            let (did_bytes, val_bytes) = item?;
+            let did = String::from_utf8(did_bytes.to_vec())?;
+            if let Ok(state) = bincode::deserialize::<ValidatorState>(&val_bytes) {
+                 validators.push(ValidatorSummary { did, state });
+            }
+        }
+        Ok(validators)
     }
 
     pub fn get_top_validators(&self, count: usize) -> Result<Vec<(String, ValidatorState)>> {
@@ -192,8 +210,9 @@ impl GlobalState {
                 encryption_key: vec![],
             });
 
-        val.reputation += 10;
         val.last_seen = block.timestamp;
+
+        val.reputation += 10;
 
         match &block.payload {
             BlockPayload::IdentityUpdate {
@@ -231,6 +250,7 @@ impl GlobalState {
             _ => {}
         }
 
+        // Commit updates to DB
         self.save_validator(&block.author_did, val)?;
         self.save_block_internal(block)?;
         Ok(())
