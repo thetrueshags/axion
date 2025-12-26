@@ -3,24 +3,23 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{anyhow, Result};
 use pqcrypto_dilithium::dilithium5;
 use pqcrypto_kyber::kyber1024;
+pub use pqcrypto_traits::kem::{
+    Ciphertext as KemCiphertext, PublicKey as KemPublicKey, SecretKey as KemSecretKey,
+    SharedSecret as KemSharedSecret,
+};
+pub use pqcrypto_traits::sign::{
+    DetachedSignature as SignSignature, PublicKey as SignPublicKey, SecretKey as SignSecretKey,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 
-// --- 1. PROFESSIONAL TRAIT RE-EXPORTS ---
-// This allows rollup devs to call .from_bytes() and .as_bytes() without
-// importing extra crates, ensuring version harmony across the mesh.
 pub mod traits {
-    pub use pqcrypto_traits::kem::{
-        Ciphertext as KemCiphertext, PublicKey as KemPublicKey, SecretKey as KemSecretKey,
-        SharedSecret as KemSharedSecret,
-    };
-    pub use pqcrypto_traits::sign::{
-        PublicKey as SignPublicKey, SecretKey as SignSecretKey, DetachedSignature as SignSignature,
+    pub use crate::{
+        KemCiphertext, KemPublicKey, KemSecretKey, KemSharedSecret, SignPublicKey, SignSecretKey,
+        SignSignature,
     };
 }
-
-use traits::*;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Keypair {
