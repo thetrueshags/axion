@@ -1,22 +1,19 @@
+use anyhow::{anyhow, Context, Result};
+use clap::{Parser, Subcommand};
+use libp2p::PeerId;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing_subscriber::FmtSubscriber;
-use warp::Filter;
 use warp::http::Method;
-use anyhow::{Result, Context, anyhow};
-use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
-use libp2p::PeerId;
+use warp::Filter;
 
-// Crate Imports
-use axion_core::{AxionBlock, BlockPayload, GlobalState, AccessPolicy};
-use axion_crypto::{Keypair, EncryptionKeypair, IdentityPoW};
+use axion_core::{AccessPolicy, AxionBlock, BlockPayload, GlobalState};
+use axion_crypto::{EncryptionKeypair, IdentityPoW, Keypair};
 use axion_net::AxionP2P;
-
-// --- 1. CLI DEFINITIONS ---
 
 #[derive(Parser)]
 #[command(name = "axion")]
@@ -28,44 +25,33 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the full node (P2P + RPC)
     Start,
-    /// Initialize a new node and identity
     Init,
-    /// Import an identity file
     ImportIdentity {
         #[arg(short, long)]
         path: String,
     },
-    /// Export the current identity
     ExportIdentity {
         #[arg(short, long)]
         output: String,
     },
-    /// Show node status
     Info,
-    /// Clean up old data
     Prune {
         #[arg(long, default_value_t = 2592000)]
         retention: u64,
     },
-    /// Manually trigger a synchronization request to a specific peer
     Sync {
         #[arg(long)]
         peer_id: String,
     },
-    /// Audit a node for data withholding and generate a Fraud Proof
     Audit {
         #[arg(long)]
         target_did: String,
         #[arg(long)]
         target_hash: String,
     },
-    /// Wipe the database
     Reset,
 }
-
-// --- 2. CONFIGURATION MANAGEMENT ---
 
 #[derive(Serialize, Deserialize, Clone)]
 struct NodeConfig {
@@ -86,19 +72,14 @@ impl Default for NodeConfig {
     }
 }
 
-// --- 3. SHARED CONTEXT ---
-
 struct NodeContext {
     state: Arc<GlobalState>,
     cmd_tx: mpsc::Sender<AxionBlock>,
     did: String,
     sign_keys: Keypair,
     enc_keys: EncryptionKeypair,
-    // We add the sync transmitter to the context so the API can trigger syncs if needed later
     sync_req_tx: mpsc::Sender<PeerId>,
 }
-
-// --- 4. IDENTITY STRUCTURE (Disk Format) ---
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PersistentIdentity {
@@ -106,8 +87,6 @@ struct PersistentIdentity {
     encryption: EncryptionKeypair,
     pow: IdentityPoW,
 }
-
-// --- 5. MAIN ENTRY POINT ---
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -127,12 +106,13 @@ async fn main() -> Result<()> {
         Commands::Info => handle_info(),
         Commands::Prune { retention } => handle_prune(*retention),
         Commands::Sync { peer_id } => handle_sync_cli(peer_id).await,
-        Commands::Audit { target_did, target_hash } => handle_audit(target_did, target_hash).await,
+        Commands::Audit {
+            target_did,
+            target_hash,
+        } => handle_audit(target_did, target_hash).await,
         Commands::Reset => handle_reset(),
     }
 }
-
-// --- 6. COMMAND HANDLERS ---
 
 async fn handle_init() -> Result<()> {
     println!("⚙️  Initializing Axion Node...");
@@ -162,7 +142,9 @@ async fn handle_start() -> Result<()> {
         return Err(anyhow!("Config not found. Please run 'axion init' first."));
     }
     if !Path::new("identity.json").exists() {
-        return Err(anyhow!("Identity not found. Please run 'axion init' first."));
+        return Err(anyhow!(
+            "Identity not found. Please run 'axion init' first."
+        ));
     }
 
     let config_str = fs::read_to_string("config.toml")?;
@@ -177,7 +159,6 @@ async fn handle_start() -> Result<()> {
 
     let state = Arc::new(GlobalState::load(&config.db_path)?);
 
-    // Auto-Genesis
     if state.get_canonical_head()?.is_empty() {
         println!("✨ Fresh Database detected. Applying Local Genesis...");
         let genesis = create_block(
@@ -185,34 +166,33 @@ async fn handle_start() -> Result<()> {
             vec!["0".repeat(64)],
             &sign_keys,
             &did,
-            BlockPayload::Genesis { message: "Axion Network Live".into() }
+            BlockPayload::Genesis {
+                message: "Axion Network Live".into(),
+            },
         )?;
         state.apply_genesis(&genesis)?;
     }
 
-    // --- CHANNEL SETUP ---
-    let (cmd_tx, cmd_rx) = mpsc::channel(32);            // Outbound Blocks (RPC -> P2P)
-    let (event_tx, mut event_rx) = mpsc::channel(32);    // Inbound Blocks (P2P -> Main)
-    let (sync_req_tx, sync_req_rx) = mpsc::channel(32);  // Sync Requests (RPC/Main -> P2P)
-
-    // --- NETWORK ENGINE ---
+    let (cmd_tx, cmd_rx) = mpsc::channel(32);
+    let (event_tx, mut event_rx) = mpsc::channel(32);
+    let (sync_req_tx, sync_req_rx) = mpsc::channel(32);
     let bootstrap = config.bootstrap_peers.first().cloned();
 
-    // Injecting State into P2P layer so it can answer historical requests
     let mut p2p = AxionP2P::new(
         "axion-mainnet",
         cmd_rx,
         event_tx,
         sync_req_rx,
         bootstrap,
-        state.clone()
-    ).await.map_err(|e| anyhow!("P2P Layer Failed: {}", e))?;
+        state.clone(),
+    )
+    .await
+    .map_err(|e| anyhow!("P2P Layer Failed: {}", e))?;
 
     tokio::spawn(async move {
         p2p.run().await;
     });
 
-    // --- RPC API ---
     let ctx = Arc::new(NodeContext {
         state: state.clone(),
         cmd_tx: cmd_tx.clone(),
@@ -227,19 +207,23 @@ async fn handle_start() -> Result<()> {
 
     tokio::spawn(async move {
         println!("🌍 RPC API listening on http://127.0.0.1:{}", rpc_port);
-        warp::serve(rpc_routes).run(([127, 0, 0, 1], rpc_port)).await;
+        warp::serve(rpc_routes)
+            .run(([127, 0, 0, 1], rpc_port))
+            .await;
     });
 
     println!("🟢 Node Online. Joining the Blob...");
     println!("⏳ Waiting for peers...");
 
-    // Main Consensus Loop
     while let Some(block) = event_rx.recv().await {
         if block.is_valid() {
-            // Check if we already have it to avoid spamming logs
             if state.get_block(&block.hash)?.is_none() {
                 match state.process_block(&block) {
-                    Ok(_) => println!("✅ Synced Block #{} (Hash: {}...)", block.index, &block.hash[0..8]),
+                    Ok(_) => println!(
+                        "✅ Synced Block #{} (Hash: {}...)",
+                        block.index,
+                        &block.hash[0..8]
+                    ),
                     Err(e) => eprintln!("❌ Block Rejection: {}", e),
                 }
             }
@@ -251,9 +235,11 @@ async fn handle_start() -> Result<()> {
 }
 
 async fn handle_audit(target_did: &String, target_hash: &String) -> Result<()> {
-    println!("🕵️ AUDIT: Investigating node {} for hash {}...", target_did, target_hash);
+    println!(
+        "🕵️ AUDIT: Investigating node {} for hash {}...",
+        target_did, target_hash
+    );
 
-    // 1. Load context
     if !Path::new("config.toml").exists() || !Path::new("identity.json").exists() {
         return Err(anyhow!("Node not initialized."));
     }
@@ -261,17 +247,17 @@ async fn handle_audit(target_did: &String, target_hash: &String) -> Result<()> {
     let (sign_keys, _, did) = load_or_create_identity("identity.json")?;
     let state = GlobalState::load(&config.db_path)?;
 
-    // 2. Check Local
     if state.get_block(target_hash)?.is_some() {
         println!("✅ Audit Passed: Data is available locally.");
         return Ok(());
     }
 
-    println!("⚠️ CONFIRM: You are accusing {} of withholding data.", target_did);
+    println!(
+        "⚠️ CONFIRM: You are accusing {} of withholding data.",
+        target_did
+    );
     println!("Creating Fraud Proof...");
 
-    // 3. Create Fraud Proof
-    // In v1.1 CLI, we sign it ourselves. In v1.2, we would gather signatures from peers.
     let accuser_sig = sign_keys.sign(target_hash.as_bytes())?;
 
     let payload = BlockPayload::FraudProof {
@@ -283,7 +269,6 @@ async fn handle_audit(target_did: &String, target_hash: &String) -> Result<()> {
     let parent = state.get_canonical_head().unwrap_or("0".repeat(64));
     let block = create_block(1, vec![parent], &sign_keys, &did, payload)?;
 
-    // 4. Commit locally (Will propagate on next full start)
     state.process_block(&block)?;
     println!("🚨 Fraud Proof Created! Hash: {}", block.hash);
     println!("Next time you run 'start', this block will be gossiped to the mesh.");
@@ -306,8 +291,8 @@ async fn handle_import(source_path: &str) -> Result<()> {
         return Err(anyhow!("Source file not found: {}", source_path));
     }
     let data = fs::read(source_path)?;
-    let _: PersistentIdentity = serde_json::from_slice(&data)
-        .context("File is not a valid Axion Identity JSON")?;
+    let _: PersistentIdentity =
+        serde_json::from_slice(&data).context("File is not a valid Axion Identity JSON")?;
     fs::copy(source_path, "identity.json")?;
     println!("✅ Identity Imported Successfully.");
     Ok(())
@@ -339,7 +324,9 @@ fn handle_info() -> Result<()> {
 }
 
 fn handle_prune(retention: u64) -> Result<()> {
-    if !Path::new("config.toml").exists() { return Err(anyhow!("Config not found.")); }
+    if !Path::new("config.toml").exists() {
+        return Err(anyhow!("Config not found."));
+    }
     let config: NodeConfig = toml::from_str(&fs::read_to_string("config.toml")?)?;
     println!("🧹 Starting Garbage Collection...");
     let state = GlobalState::load(&config.db_path)?;
@@ -356,8 +343,12 @@ fn handle_reset() -> Result<()> {
     std::io::stdin().read_line(&mut input)?;
     if input.trim() == "RESET" {
         println!("💥 Wiping data...");
-        if Path::new("axion_db").exists() { fs::remove_dir_all("axion_db")?; }
-        if Path::new("config.toml").exists() { fs::remove_file("config.toml")?; }
+        if Path::new("axion_db").exists() {
+            fs::remove_dir_all("axion_db")?;
+        }
+        if Path::new("config.toml").exists() {
+            fs::remove_file("config.toml")?;
+        }
         println!("✅ Reset Complete.");
     } else {
         println!("❌ Cancelled.");
@@ -365,29 +356,25 @@ fn handle_reset() -> Result<()> {
     Ok(())
 }
 
-// --- 7. HELPER FUNCTIONS ---
-
-fn build_routes(ctx: Arc<NodeContext>) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
-
-    // 1. CORS Policy (Critical for Explorer)
+fn build_routes(
+    ctx: Arc<NodeContext>,
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     let cors = warp::cors()
         .allow_any_origin()
         .allow_methods(vec![Method::GET, Method::POST])
         .allow_headers(vec!["content-type"]);
 
-    let announce_route = warp::path("announce_key")
-        .and(warp::post())
-        .map({
-            let ctx = ctx.clone();
-            move || {
-                let payload = BlockPayload::IdentityUpdate {
-                    did: ctx.did.clone(),
-                    new_encryption_key: ctx.enc_keys.public.clone()
-                };
-                submit_block(&ctx, payload);
-                warp::reply::json(&"Key Announced")
-            }
-        });
+    let announce_route = warp::path("announce_key").and(warp::post()).map({
+        let ctx = ctx.clone();
+        move || {
+            let payload = BlockPayload::IdentityUpdate {
+                did: ctx.did.clone(),
+                new_encryption_key: ctx.enc_keys.public.clone(),
+            };
+            submit_block(&ctx, payload);
+            warp::reply::json(&"Key Announced")
+        }
+    });
 
     let publish_route = warp::path("publish")
         .and(warp::post())
@@ -400,22 +387,40 @@ fn build_routes(ctx: Arc<NodeContext>) -> impl Filter<Extract = impl warp::Reply
                 let data_bytes = hex::decode(data_hex).unwrap_or_default();
 
                 let (policy, blob, keys) = match mode {
-                    "public" => (AccessPolicy::Public, data_bytes, std::collections::HashMap::new()),
+                    "public" => (
+                        AccessPolicy::Public,
+                        data_bytes,
+                        std::collections::HashMap::new(),
+                    ),
                     "private" => {
                         let recipient_did = json["recipient"].as_str().unwrap_or("");
                         if let Ok(Some(val)) = ctx.state.get_validator(recipient_did) {
                             if val.encryption_key.is_empty() {
-                                return warp::reply::json(&"Error: Recipient has no Kyber key registered");
+                                return warp::reply::json(
+                                    &"Error: Recipient has no Kyber key registered",
+                                );
                             }
-                            let (kem, nonce, cipher) = axion_crypto::hybrid_encrypt(&val.encryption_key, &data_bytes).unwrap();
+                            let (kem, nonce, cipher) =
+                                axion_crypto::hybrid_encrypt(&val.encryption_key, &data_bytes)
+                                    .unwrap();
                             let mut key_map = std::collections::HashMap::new();
                             key_map.insert(recipient_did.to_string(), (kem, nonce));
-                            (AccessPolicy::Private { recipient: recipient_did.into() }, cipher, key_map)
+                            (
+                                AccessPolicy::Private {
+                                    recipient: recipient_did.into(),
+                                },
+                                cipher,
+                                key_map,
+                            )
                         } else {
                             return warp::reply::json(&"Error: Recipient DID not found in state");
                         }
-                    },
-                    _ => (AccessPolicy::Public, vec![], std::collections::HashMap::new())
+                    }
+                    _ => (
+                        AccessPolicy::Public,
+                        vec![],
+                        std::collections::HashMap::new(),
+                    ),
                 };
 
                 let payload = BlockPayload::DataStore { policy, blob, keys };
@@ -424,67 +429,53 @@ fn build_routes(ctx: Arc<NodeContext>) -> impl Filter<Extract = impl warp::Reply
             }
         });
 
-    let query_route = warp::path!("query" / String)
-        .and(warp::get())
-        .map({
-            let ctx = ctx.clone();
-            move |hash: String| {
-                match ctx.state.get_block(&hash) {
-                    Ok(Some(block)) => warp::reply::json(&block),
-                    Ok(None) => warp::reply::json(&"Error: Block not found"),
-                    Err(e) => warp::reply::json(&format!("Error: {}", e)),
-                }
-            }
-        });
+    let query_route = warp::path!("query" / String).and(warp::get()).map({
+        let ctx = ctx.clone();
+        move |hash: String| match ctx.state.get_block(&hash) {
+            Ok(Some(block)) => warp::reply::json(&block),
+            Ok(None) => warp::reply::json(&"Error: Block not found"),
+            Err(e) => warp::reply::json(&format!("Error: {}", e)),
+        }
+    });
 
-    // NEW: Trigger Sync Endpoint (Called by Explorer or CLI tools)
-    let sync_route = warp::path!("sync" / String)
-        .and(warp::post())
-        .map({
-             let ctx = ctx.clone();
-             move |peer_str: String| {
-                 if let Ok(peer_id) = peer_str.parse::<PeerId>() {
-                     let _ = ctx.sync_req_tx.try_send(peer_id);
-                     warp::reply::json(&"Sync Requested")
-                 } else {
-                     warp::reply::json(&"Invalid Peer ID")
-                 }
-             }
-        });
+    let sync_route = warp::path!("sync" / String).and(warp::post()).map({
+        let ctx = ctx.clone();
+        move |peer_str: String| {
+            if let Ok(peer_id) = peer_str.parse::<PeerId>() {
+                let _ = ctx.sync_req_tx.try_send(peer_id);
+                warp::reply::json(&"Sync Requested")
+            } else {
+                warp::reply::json(&"Invalid Peer ID")
+            }
+        }
+    });
 
     let state_route = warp::path("state")
         .and(warp::get())
-        .map(|| {
-            warp::reply::json(&"Node is Active.")
-        });
+        .map(|| warp::reply::json(&"Node is Active."));
 
-    let blocks_route = warp::path!("api" / "blocks")
-        .and(warp::get())
-        .map({
-            let ctx = ctx.clone();
-            move || {
-                let blocks = ctx.state.get_recent_blocks(50).unwrap_or_default();
-                warp::reply::json(&blocks)
-            }
-        });
+    let blocks_route = warp::path!("api" / "blocks").and(warp::get()).map({
+        let ctx = ctx.clone();
+        move || {
+            let blocks = ctx.state.get_recent_blocks(50).unwrap_or_default();
+            warp::reply::json(&blocks)
+        }
+    });
 
-    let stats_route = warp::path!("api" / "stats")
-        .and(warp::get())
-        .map({
-            let ctx = ctx.clone();
-            move || {
-                let (blocks, peers, cas) = ctx.state.get_stats().unwrap_or((0,0,0));
-                warp::reply::json(&serde_json::json!({
-                    "block_height": blocks,
-                    "known_peers": peers,
-                    "cas_objects": cas,
-                    "node_did": ctx.did
-                }))
-            }
-        });
+    let stats_route = warp::path!("api" / "stats").and(warp::get()).map({
+        let ctx = ctx.clone();
+        move || {
+            let (blocks, peers, cas) = ctx.state.get_stats().unwrap_or((0, 0, 0));
+            warp::reply::json(&serde_json::json!({
+                "block_height": blocks,
+                "known_peers": peers,
+                "cas_objects": cas,
+                "node_did": ctx.did
+            }))
+        }
+    });
 
-    let ui_route = warp::path("ui")
-        .and(warp::fs::file("explorer.html"));
+    let ui_route = warp::path("ui").and(warp::fs::file("explorer.html"));
 
     announce_route
         .or(publish_route)
@@ -501,7 +492,11 @@ fn submit_block(ctx: &NodeContext, payload: BlockPayload) {
     let parent = ctx.state.get_canonical_head().unwrap_or("0".repeat(64));
 
     if let Ok(block) = create_block(1, vec![parent], &ctx.sign_keys, &ctx.did, payload) {
-        println!("🚀 Locally Minted Block #{} (Hash: {}...)", block.index, &block.hash[0..8]);
+        println!(
+            "🚀 Locally Minted Block #{} (Hash: {}...)",
+            block.index,
+            &block.hash[0..8]
+        );
 
         let tx = ctx.cmd_tx.clone();
         let block_clone = block.clone();
@@ -520,14 +515,20 @@ fn submit_block(ctx: &NodeContext, payload: BlockPayload) {
     }
 }
 
-fn create_block(idx: u64, parents: Vec<String>, keys: &Keypair, did: &str, payload: BlockPayload) -> Result<AxionBlock> {
+fn create_block(
+    idx: u64,
+    parents: Vec<String>,
+    keys: &Keypair,
+    did: &str,
+    payload: BlockPayload,
+) -> Result<AxionBlock> {
     let mut b = AxionBlock::new(
         idx,
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         parents,
         did.to_string(),
         payload,
-        keys.public.clone()
+        keys.public.clone(),
     );
 
     b.hash = b.calculate_hash();

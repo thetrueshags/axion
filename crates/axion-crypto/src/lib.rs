@@ -1,15 +1,27 @@
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
+use anyhow::{anyhow, Result};
 use pqcrypto_dilithium::dilithium5;
 use pqcrypto_kyber::kyber1024;
-use pqcrypto_traits::sign::{DetachedSignature, PublicKey as PqPublicKey, SecretKey as PqSecretKey};
-use pqcrypto_traits::kem::{Ciphertext as KemCiphertext, SharedSecret as KemSharedSecret, PublicKey as KemPublicKey, SecretKey as KemSecretKey};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
-use aes_gcm::aead::{Aead, KeyInit};
 use rand::RngCore;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
-use anyhow::{Result, anyhow};
 
-// --- 1. IDENTITY (SIGNING) ---
+// --- 1. PROFESSIONAL TRAIT RE-EXPORTS ---
+// This allows rollup devs to call .from_bytes() and .as_bytes() without
+// importing extra crates, ensuring version harmony across the mesh.
+pub mod traits {
+    pub use pqcrypto_traits::kem::{
+        Ciphertext as KemCiphertext, PublicKey as KemPublicKey, SecretKey as KemSecretKey,
+        SharedSecret as KemSharedSecret,
+    };
+    pub use pqcrypto_traits::sign::{
+        PublicKey as SignPublicKey, SecretKey as SignSecretKey, DetachedSignature as SignSignature,
+    };
+}
+
+use traits::*;
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Keypair {
     pub public: Vec<u8>,
@@ -27,13 +39,19 @@ impl Keypair {
 
     pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
         let sk = dilithium5::SecretKey::from_bytes(&self.secret)
-            .map_err(|_| anyhow!("Invalid secret key"))?;
+            .map_err(|_| anyhow!("Crypto Error: Failed to load Dilithium5 Secret Key"))?;
         let signature = dilithium5::detached_sign(message, &sk);
         Ok(signature.as_bytes().to_vec())
     }
 }
 
 pub fn verify_signature(pk_bytes: &[u8], msg: &[u8], sig_bytes: &[u8]) -> bool {
+    if pk_bytes.len() != dilithium5::public_key_bytes()
+        || sig_bytes.len() != dilithium5::signature_bytes()
+    {
+        return false;
+    }
+
     if let (Ok(pk), Ok(sig)) = (
         dilithium5::PublicKey::from_bytes(pk_bytes),
         dilithium5::DetachedSignature::from_bytes(sig_bytes),
@@ -44,20 +62,20 @@ pub fn verify_signature(pk_bytes: &[u8], msg: &[u8], sig_bytes: &[u8]) -> bool {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PublicKey(pub Vec<u8>);
 
 impl PublicKey {
-    pub fn from_bytes(bytes: &[u8]) -> Self { Self(bytes.to_vec()) }
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        Self(bytes.to_vec())
+    }
 
     pub fn to_did_hash(&self) -> String {
         let mut hasher = Sha3_256::new();
         hasher.update(&self.0);
-        hex::encode(hasher.finalize())
+        format!("did:axion:{}", hex::encode(hasher.finalize()))
     }
 }
-
-// --- 2. DATA PRIVACY (ENCRYPTION) ---
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct EncryptionKeypair {
@@ -77,57 +95,69 @@ impl EncryptionKeypair {
 
 pub fn hybrid_encrypt(recipient_pubkey: &[u8], data: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     let pk = kyber1024::PublicKey::from_bytes(recipient_pubkey)
-        .map_err(|_| anyhow!("Invalid Kyber Public Key"))?;
+        .map_err(|_| anyhow!("Security Error: Recipient Public Key is corrupted or invalid"))?;
+
     let (shared_secret, kem_ciphertext) = kyber1024::encapsulate(&pk);
 
-    let key = Key::<Aes256Gcm>::from_slice(shared_secret.as_bytes());
+    let key_bytes = &shared_secret.as_bytes()[..32];
+    let key = Key::<Aes256Gcm>::from_slice(key_bytes);
     let cipher = Aes256Gcm::new(key);
 
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let aes_ciphertext = cipher.encrypt(nonce, data)
-        .map_err(|_| anyhow!("AES Encryption Failed"))?;
+    let aes_ciphertext = cipher
+        .encrypt(nonce, data)
+        .map_err(|_| anyhow!("AES Encryption failure: Check data integrity"))?;
 
-    Ok((kem_ciphertext.as_bytes().to_vec(), nonce_bytes.to_vec(), aes_ciphertext))
+    Ok((
+        kem_ciphertext.as_bytes().to_vec(),
+        nonce_bytes.to_vec(),
+        aes_ciphertext,
+    ))
 }
 
-pub fn hybrid_decrypt(recipient_secret: &[u8], kem_ct: &[u8], nonce: &[u8], aes_ct: &[u8]) -> Result<Vec<u8>> {
+pub fn hybrid_decrypt(
+    recipient_secret: &[u8],
+    kem_ct: &[u8],
+    nonce: &[u8],
+    aes_ct: &[u8],
+) -> Result<Vec<u8>> {
     let sk = kyber1024::SecretKey::from_bytes(recipient_secret)
-        .map_err(|_| anyhow!("Invalid Kyber Secret Key"))?;
+        .map_err(|_| anyhow!("Security Error: Invalid decryption key"))?;
+
     let ct = kyber1024::Ciphertext::from_bytes(kem_ct)
-        .map_err(|_| anyhow!("Invalid Ciphertext"))?;
+        .map_err(|_| anyhow!("Security Error: KEM Ciphertext mismatch"))?;
 
     let shared_secret = kyber1024::decapsulate(&ct, &sk);
 
-    let key = Key::<Aes256Gcm>::from_slice(shared_secret.as_bytes());
+    let key_bytes = &shared_secret.as_bytes()[..32];
+    let key = Key::<Aes256Gcm>::from_slice(key_bytes);
     let cipher = Aes256Gcm::new(key);
-    let nonce = Nonce::from_slice(nonce);
+    let nonce_val = Nonce::from_slice(nonce);
 
-    let plaintext = cipher.decrypt(nonce, aes_ct)
-        .map_err(|_| anyhow!("AES Decryption Failed"))?;
+    let plaintext = cipher.decrypt(nonce_val, aes_ct).map_err(|_| {
+        anyhow!("Decryption Failed: Data may have been tampered with or incorrect key used")
+    })?;
 
     Ok(plaintext)
 }
 
-// --- 3. IDENTITY MINTING (PoW) ---
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IdentityPoW {
     pub nonce: u64,
-    pub difficulty: u32, // Number of leading zero bits required
+    pub difficulty: u32,
 }
 
 impl IdentityPoW {
     pub fn mint(public_key: &[u8], difficulty: u32) -> Self {
         let mut nonce = 0u64;
-        let mut hasher = Sha3_256::new();
-
         loop {
+            let mut hasher = Sha3_256::new();
             hasher.update(public_key);
             hasher.update(nonce.to_le_bytes());
-            let result = hasher.finalize_reset();
+            let result = hasher.finalize();
 
             if check_difficulty(&result, difficulty) {
                 return Self { nonce, difficulty };
@@ -147,7 +177,7 @@ impl IdentityPoW {
 
 fn check_difficulty(hash: &[u8], difficulty_bits: u32) -> bool {
     let mut bits_checked = 0;
-    for byte in hash {
+    for &byte in hash {
         for i in (0..8).rev() {
             if bits_checked >= difficulty_bits {
                 return true;
