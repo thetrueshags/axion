@@ -23,7 +23,11 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
-enum Commands { Start, Init, Reset }
+enum Commands {
+    Start,
+    Init,
+    Reset,
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 struct NodeConfig {
@@ -68,7 +72,9 @@ struct AnnounceRequest {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let subscriber = FmtSubscriber::builder().with_max_level(tracing::Level::INFO).finish();
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(tracing::Level::INFO)
+        .finish();
     tracing::subscriber::set_global_default(subscriber)?;
     let cli = Cli::parse();
     match &cli.command {
@@ -101,7 +107,15 @@ async fn handle_start() -> Result<()> {
 
     let state = Arc::new(GlobalState::load(&config.db_path)?);
     if state.get_canonical_head()?.is_empty() {
-        let genesis = create_block(0, vec!["0".repeat(64)], &sign_keys, &did, BlockPayload::Genesis { message: "Axion Network Live".into() })?;
+        let genesis = create_block(
+            0,
+            vec!["0".repeat(64)],
+            &sign_keys,
+            &did,
+            BlockPayload::Genesis {
+                message: "Axion Network Live".into(),
+            },
+        )?;
         state.apply_genesis(&genesis)?;
     }
 
@@ -117,9 +131,13 @@ async fn handle_start() -> Result<()> {
         sync_req_rx,
         bootstrap,
         state.clone(),
-    ).await.map_err(|e| anyhow!("P2P Layer Failed: {}", e))?;
+    )
+    .await
+    .map_err(|e| anyhow!("P2P Layer Failed: {}", e))?;
 
-    tokio::spawn(async move { p2p.run().await; });
+    tokio::spawn(async move {
+        p2p.run().await;
+    });
 
     let ctx = Arc::new(NodeContext {
         state: state.clone(),
@@ -134,7 +152,9 @@ async fn handle_start() -> Result<()> {
     let rpc_port = config.rpc_port;
     tokio::spawn(async move {
         println!("🌍 RPC API listening on http://127.0.0.1:{}", rpc_port);
-        warp::serve(rpc_routes).run(([127, 0, 0, 1], rpc_port)).await;
+        warp::serve(rpc_routes)
+            .run(([127, 0, 0, 1], rpc_port))
+            .await;
     });
 
     println!("🟢 Node Online. Processing Mesh events...");
@@ -144,7 +164,11 @@ async fn handle_start() -> Result<()> {
         if block.is_valid() {
             if state.get_block(&block.hash)?.is_none() {
                 match state.process_block(&block) {
-                    Ok(_) => println!("✅ Synced Block #{} (Hash: {}...)", block.index, &block.hash[0..8]),
+                    Ok(_) => println!(
+                        "✅ Synced Block #{} (Hash: {}...)",
+                        block.index,
+                        &block.hash[0..8]
+                    ),
                     Err(e) => eprintln!("❌ Block Rejection: {}", e),
                 }
             }
@@ -160,70 +184,104 @@ fn handle_reset() -> Result<()> {
     Ok(())
 }
 
-fn build_routes(ctx: Arc<NodeContext>) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
-    let cors = warp::cors().allow_any_origin().allow_methods(vec![Method::GET, Method::POST]).allow_headers(vec!["content-type"]);
+fn build_routes(
+    ctx: Arc<NodeContext>,
+) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    let cors = warp::cors()
+        .allow_any_origin()
+        .allow_methods(vec![Method::GET, Method::POST])
+        .allow_headers(vec!["content-type"]);
 
-    let announce_route = warp::path("announce_key").and(warp::post()).and(warp::body::json()).map({
-        let ctx = ctx.clone();
-        move |req: AnnounceRequest| {
-            let target_did = req.did.unwrap_or(ctx.did.clone());
-            let target_key_bytes = if let Some(hex_key) = req.encryption_key {
-                hex::decode(hex_key).unwrap_or(ctx.enc_keys.public.clone())
-            } else { ctx.enc_keys.public.clone() };
+    let announce_route = warp::path("announce_key")
+        .and(warp::post())
+        .and(warp::body::json())
+        .map({
+            let ctx = ctx.clone();
+            move |req: AnnounceRequest| {
+                let target_did = req.did.unwrap_or(ctx.did.clone());
+                let target_key_bytes = if let Some(hex_key) = req.encryption_key {
+                    hex::decode(hex_key).unwrap_or(ctx.enc_keys.public.clone())
+                } else {
+                    ctx.enc_keys.public.clone()
+                };
 
-            let payload = BlockPayload::IdentityUpdate { did: target_did.clone(), new_encryption_key: target_key_bytes };
-            match submit_block_sync(&ctx, payload) {
-                Ok(_) => warp::reply::json(&"Key Announced and Committed"),
-                Err(e) => warp::reply::json(&format!("Error: {}", e)),
-            }
-        }
-    });
-
-    let publish_route = warp::path("publish").and(warp::post()).and(warp::body::json()).map({
-        let ctx = ctx.clone();
-        move |json: serde_json::Value| {
-            let mode = json["type"].as_str().unwrap_or("public");
-            let data_hex = json["data"].as_str().unwrap_or("");
-            let data_bytes = hex::decode(data_hex).unwrap_or_default();
-
-            if mode == "private" {
-                let raw_recipient = json["recipient"].as_str().unwrap_or("");
-                let lookup_key = if raw_recipient.starts_with("did:axion:") { raw_recipient.to_string() } else { format!("did:axion:{}", raw_recipient) };
-
-                match ctx.state.get_validator(&lookup_key) {
-                    Ok(Some(val)) => {
-                        let (kem, nonce, cipher) = axion_crypto::hybrid_encrypt(&val.encryption_key, &data_bytes).unwrap();
-                        let mut key_map = std::collections::HashMap::new();
-                        key_map.insert(lookup_key.clone(), (kem, nonce));
-
-                        let payload = BlockPayload::DataStore {
-                            policy: AccessPolicy::Private { recipient: lookup_key.into() },
-                            blob: cipher,
-                            keys: key_map,
-                        };
-                        let _ = submit_block_sync(&ctx, payload);
-                        warp::reply::json(&"Data Double-Encrypted & Published")
-                    },
-                    _ => warp::reply::json(&"Error: DID not found"),
+                let payload = BlockPayload::IdentityUpdate {
+                    did: target_did.clone(),
+                    new_encryption_key: target_key_bytes,
+                };
+                match submit_block_sync(&ctx, payload) {
+                    Ok(_) => warp::reply::json(&"Key Announced and Committed"),
+                    Err(e) => warp::reply::json(&format!("Error: {}", e)),
                 }
-            } else {
-                warp::reply::json(&"Public not supported")
             }
-        }
-    });
+        });
+
+    let publish_route = warp::path("publish")
+        .and(warp::post())
+        .and(warp::body::json())
+        .map({
+            let ctx = ctx.clone();
+            move |json: serde_json::Value| {
+                let mode = json["type"].as_str().unwrap_or("public");
+                let data_hex = json["data"].as_str().unwrap_or("");
+                let data_bytes = hex::decode(data_hex).unwrap_or_default();
+
+                if mode == "private" {
+                    let raw_recipient = json["recipient"].as_str().unwrap_or("");
+                    let lookup_key = if raw_recipient.starts_with("did:axion:") {
+                        raw_recipient.to_string()
+                    } else {
+                        format!("did:axion:{}", raw_recipient)
+                    };
+
+                    match ctx.state.get_validator(&lookup_key) {
+                        Ok(Some(val)) => {
+                            let (kem, nonce, cipher) =
+                                axion_crypto::hybrid_encrypt(&val.encryption_key, &data_bytes)
+                                    .unwrap();
+                            let mut key_map = std::collections::HashMap::new();
+                            key_map.insert(lookup_key.clone(), (kem, nonce));
+
+                            let payload = BlockPayload::DataStore {
+                                policy: AccessPolicy::Private {
+                                    recipient: lookup_key.into(),
+                                },
+                                blob: cipher,
+                                keys: key_map,
+                            };
+                            let _ = submit_block_sync(&ctx, payload);
+                            warp::reply::json(&"Data Double-Encrypted & Published")
+                        }
+                        _ => warp::reply::json(&"Error: DID not found"),
+                    }
+                } else {
+                    warp::reply::json(&"Public not supported")
+                }
+            }
+        });
 
     let list_route = warp::path!("api" / "vault" / String).and(warp::get()).map({
         let ctx = ctx.clone();
         move |target_did: String| {
             let all_blocks = ctx.state.get_recent_blocks(100).unwrap_or_default();
-            let my_secrets: Vec<AxionBlock> = all_blocks.into_iter().filter_map(|b| {
-                if let BlockPayload::DataStore { policy, .. } = &b.payload {
-                    match policy {
-                        AccessPolicy::Private { recipient } if recipient == &target_did => ctx.state.get_block(&b.hash).ok().flatten(),
-                        _ => None,
+
+            let my_secrets: Vec<AxionBlock> = all_blocks
+                .into_iter()
+                .filter_map(|b| {
+                    if let BlockPayload::DataStore { policy, .. } = &b.payload {
+                        match policy {
+                            AccessPolicy::Private { recipient } if recipient == &target_did => {
+                                // Fetch the full block to ensure CAS blob is attached
+                                ctx.state.get_block(&b.hash).ok().flatten()
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
                     }
-                } else { None }
-            }).collect();
+                })
+                .collect();
+
             warp::reply::json(&my_secrets)
         }
     });
@@ -241,7 +299,11 @@ fn build_routes(ctx: Arc<NodeContext>) -> impl Filter<Extract = impl warp::Reply
         }
     });
 
-    announce_route.or(publish_route).or(list_route).or(sync_trigger).with(cors)
+    announce_route
+        .or(publish_route)
+        .or(list_route)
+        .or(sync_trigger)
+        .with(cors)
 }
 
 fn submit_block_sync(ctx: &NodeContext, payload: BlockPayload) -> Result<()> {
@@ -255,13 +317,28 @@ fn submit_block_sync(ctx: &NodeContext, payload: BlockPayload) -> Result<()> {
         let _ = tx.send(block_clone).await;
     });
 
-    ctx.state.process_block(&block).map_err(|e| anyhow!("State Write Failed: {}", e))?;
+    ctx.state
+        .process_block(&block)
+        .map_err(|e| anyhow!("State Write Failed: {}", e))?;
     println!("💾 State Sync: Block #{} committed.", block.index);
     Ok(())
 }
 
-fn create_block(idx: u64, parents: Vec<String>, keys: &Keypair, did: &str, payload: BlockPayload) -> Result<AxionBlock> {
-    let mut b = AxionBlock::new(idx, SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(), parents, did.to_string(), payload, keys.public.clone());
+fn create_block(
+    idx: u64,
+    parents: Vec<String>,
+    keys: &Keypair,
+    did: &str,
+    payload: BlockPayload,
+) -> Result<AxionBlock> {
+    let mut b = AxionBlock::new(
+        idx,
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        parents,
+        did.to_string(),
+        payload,
+        keys.public.clone(),
+    );
     b.hash = b.calculate_hash();
     b.signature = keys.sign(&hex::decode(&b.hash)?)?;
     Ok(b)
@@ -278,7 +355,11 @@ fn load_or_create_identity(path: &str) -> Result<(Keypair, EncryptionKeypair, St
     let e_keys = EncryptionKeypair::generate();
     let pow = IdentityPoW::mint(&s_keys.public, 16);
     let did = axion_crypto::PublicKey::from_bytes(&s_keys.public).to_did_hash();
-    let identity = PersistentIdentity { signing: s_keys.clone(), encryption: e_keys.clone(), pow };
+    let identity = PersistentIdentity {
+        signing: s_keys.clone(),
+        encryption: e_keys.clone(),
+        pow,
+    };
     fs::write(path, serde_json::to_string_pretty(&identity)?)?;
     Ok((s_keys, e_keys, did))
 }
