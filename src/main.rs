@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result}; // Removed unused 'Context'
+use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
@@ -120,7 +120,7 @@ async fn handle_start() -> Result<()> {
     }
 
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
-    let (event_tx, mut event_rx) = mpsc::channel(32); // Now used
+    let (event_tx, mut event_rx) = mpsc::channel(32);
     let (sync_req_tx, sync_req_rx) = mpsc::channel(32);
     let bootstrap = config.bootstrap_peers.first().cloned();
 
@@ -159,7 +159,6 @@ async fn handle_start() -> Result<()> {
 
     println!("🟢 Node Online. Processing Mesh events...");
 
-    // RESTORED: Process incoming blocks from the network
     while let Some(block) = event_rx.recv().await {
         if block.is_valid() {
             if state.get_block(&block.hash)?.is_none() {
@@ -271,7 +270,6 @@ fn build_routes(
                     if let BlockPayload::DataStore { policy, .. } = &b.payload {
                         match policy {
                             AccessPolicy::Private { recipient } if recipient == &target_did => {
-                                // Fetch the full block to ensure CAS blob is attached
                                 ctx.state.get_block(&b.hash).ok().flatten()
                             }
                             _ => None,
@@ -286,7 +284,6 @@ fn build_routes(
         }
     });
 
-    // RESTORED: Manual Sync Trigger uses 'sync_req_tx' field
     let sync_trigger = warp::path!("api" / "sync" / String).and(warp::post()).map({
         let ctx = ctx.clone();
         move |peer_str: String| {
@@ -310,7 +307,6 @@ fn submit_block_sync(ctx: &NodeContext, payload: BlockPayload) -> Result<()> {
     let parent = ctx.state.get_canonical_head().unwrap_or("0".repeat(64));
     let block = create_block(1, vec![parent], &ctx.sign_keys, &ctx.did, payload)?;
 
-    // RESTORED: Gossip Broadcast uses 'cmd_tx' field
     let tx = ctx.cmd_tx.clone();
     let block_clone = block.clone();
     tokio::spawn(async move {
