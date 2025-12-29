@@ -118,10 +118,10 @@ pub fn hybrid_encrypt(recipient_pubkey: &[u8], data: &[u8]) -> Result<(Vec<u8>, 
 }
 
 pub fn hybrid_decrypt(
-    recipient_secret: &[u8],
+    aes_ct: &[u8],
     kem_ct: &[u8],
     nonce: &[u8],
-    aes_ct: &[u8],
+    recipient_secret: &[u8],
 ) -> Result<Vec<u8>> {
     let sk = kyber1024::SecretKey::from_bytes(recipient_secret)
         .map_err(|_| anyhow!("Security Error: Invalid decryption key"))?;

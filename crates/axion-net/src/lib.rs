@@ -12,10 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-// Import Core State
 use axion_core::{AxionBlock, GlobalState};
-
-// --- SYNC PROTOCOL ---
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncRequest {
@@ -28,8 +25,6 @@ pub struct SyncResponse {
     pub blocks: Vec<AxionBlock>,
 }
 
-// --- NETWORK BEHAVIOR ---
-
 #[derive(NetworkBehaviour)]
 pub struct AxionBehavior {
     pub gossipsub: gossipsub::Behaviour,
@@ -37,9 +32,6 @@ pub struct AxionBehavior {
     pub mdns: mdns::tokio::Behaviour,
     pub req_resp: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
 }
-
-// --- P2P ENGINE ---
-
 pub struct AxionP2P {
     swarm: Swarm<AxionBehavior>,
     cmd_rx: mpsc::Receiver<AxionBlock>,
@@ -67,7 +59,6 @@ impl AxionP2P {
             .with_behaviour(|key| {
                 let peer_id = key.public().to_peer_id();
 
-                // 1. GossipSub
                 let gossip_msg_id = |message: &gossipsub::Message| {
                     let mut s = std::collections::hash_map::DefaultHasher::new();
                     message.data.hash(&mut s);
@@ -100,7 +91,6 @@ impl AxionP2P {
 
                 let topic = gossipsub::IdentTopic::new(topic_name);
 
-                // FIX: Use std::io::Error to wrap the string/custom error from libp2p
                 gossipsub.subscribe(&topic).map_err(|e| {
                     Box::new(std::io::Error::new(
                         std::io::ErrorKind::Other,
@@ -108,7 +98,6 @@ impl AxionP2P {
                     )) as Box<dyn Error + Send + Sync>
                 })?;
 
-                // 2. Request-Response
                 let req_resp = request_response::cbor::Behaviour::new(
                     [(
                         StreamProtocol::new("/axion/sync/1"),
@@ -117,7 +106,6 @@ impl AxionP2P {
                     request_response::Config::default(),
                 );
 
-                // 3. Kademlia & mDNS
                 let mut kademlia = kad::Behaviour::new(peer_id, MemoryStore::new(peer_id));
                 kademlia.set_mode(Some(kad::Mode::Server));
 

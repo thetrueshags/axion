@@ -34,6 +34,33 @@ pub enum BlockPayload {
     },
 }
 
+impl BlockPayload {
+    pub fn get_keys_for(&self, did: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+        if let BlockPayload::DataStore { keys, .. } = self {
+            let raw_did = did.replace("did:axion:", "");
+            let full_did = if !did.starts_with("did:axion:") {
+                format!("did:axion:{}", did)
+            } else {
+                did.to_string()
+            };
+
+            if let Some(k) = keys.get(did) {
+                return Ok(k.clone());
+            }
+            if let Some(k) = keys.get(&raw_did) {
+                return Ok(k.clone());
+            }
+            if let Some(k) = keys.get(&full_did) {
+                return Ok(k.clone());
+            }
+
+            Err(anyhow!("No encryption keys found for DID: {}", did))
+        } else {
+            Err(anyhow!("Not a DataStore block"))
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AxionBlock {
     pub index: u64,
@@ -129,6 +156,26 @@ pub struct GlobalState {
 impl GlobalState {
     const INITIAL_REPUTATION: u64 = 1_000_000;
 
+    pub fn get_blocks_range(&self, start_index: u64, limit: usize) -> Result<Vec<AxionBlock>> {
+        let start_key = start_index.to_be_bytes();
+        let mut result = Vec::new();
+
+        for item in self.heights.range(start_key..) {
+            let (_, value) = item?;
+            let hashes: Vec<String> = bincode::deserialize(&value)?;
+
+            for hash in hashes {
+                if let Some(block) = self.get_block(&hash)? {
+                    result.push(block);
+                    if result.len() >= limit {
+                        return Ok(result);
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
     pub fn load(path: &str) -> Result<Self> {
         let db = sled::open(path).context("DB Open Failed")?;
         Ok(Self {
@@ -201,7 +248,6 @@ impl GlobalState {
             return Ok(());
         }
 
-        // 1. Load the Block Author (The Node) to update their reputation/heartbeat
         let mut author_val = self
             .get_validator(&block.author_did)?
             .unwrap_or(ValidatorState {
@@ -230,10 +276,7 @@ impl GlobalState {
                 target_val.last_seen = block.timestamp;
 
                 self.save_validator(target_did, target_val)?;
-                println!(
-                    "💾 [STATE] Successfully Registered External Identity: {}",
-                    target_did
-                );
+                println!("💾 [STATE] Registered External Identity: {}", target_did);
             }
             BlockPayload::FraudProof {
                 accused_did,
@@ -266,7 +309,6 @@ impl GlobalState {
         }
 
         self.save_validator(&block.author_did, author_val)?;
-
         self.save_block_internal(block)?;
         Ok(())
     }
@@ -333,26 +375,6 @@ impl GlobalState {
             }
             None => Ok(None),
         }
-    }
-
-    pub fn get_blocks_range(&self, start_index: u64, limit: usize) -> Result<Vec<AxionBlock>> {
-        let start_key = start_index.to_be_bytes();
-        let mut result = Vec::new();
-
-        for item in self.heights.range(start_key..) {
-            let (_, value) = item?;
-            let hashes: Vec<String> = bincode::deserialize(&value)?;
-
-            for hash in hashes {
-                if let Some(block) = self.get_block(&hash)? {
-                    result.push(block);
-                    if result.len() >= limit {
-                        return Ok(result);
-                    }
-                }
-            }
-        }
-        Ok(result)
     }
 
     pub fn get_recent_blocks(&self, limit: usize) -> Result<Vec<AxionBlock>> {
