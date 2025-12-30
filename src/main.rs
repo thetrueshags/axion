@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
-use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -54,7 +53,6 @@ struct NodeContext {
     did: String,
     sign_keys: Keypair,
     enc_keys: EncryptionKeypair,
-    sync_req_tx: mpsc::Sender<PeerId>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -64,13 +62,26 @@ struct PersistentIdentity {
     pow: IdentityPoW,
 }
 
+#[derive(Deserialize)]
+struct AnnounceRequest {
+    did: Option<String>,
+    encryption_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BlockQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    author: Option<String>,
+    recipient: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let subscriber = FmtSubscriber::builder()
         .with_max_level(tracing::Level::INFO)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
-
     let cli = Cli::parse();
     match &cli.command {
         Commands::Init => handle_init().await,
@@ -78,7 +89,6 @@ async fn main() -> Result<()> {
         Commands::Reset => {
             let _ = fs::remove_dir_all("axion_db");
             let _ = fs::remove_file("config.toml");
-            println!("✅ Reset Complete.");
             Ok(())
         }
     }
@@ -103,13 +113,11 @@ async fn handle_start() -> Result<()> {
     if !Path::new("config.toml").exists() {
         return Err(anyhow!("Run 'init' first"));
     }
-
     let config: NodeConfig = toml::from_str(&fs::read_to_string("config.toml")?)?;
     let (sign_keys, enc_keys, did) = load_or_create_identity("identity.json")?;
     println!("👤 DID: {}\n🌍 Bootstrapping...", did);
 
     let state = Arc::new(GlobalState::load(&config.db_path)?);
-
     if state.get_canonical_head()?.is_empty() {
         let genesis = create_block(
             0,
@@ -125,7 +133,7 @@ async fn handle_start() -> Result<()> {
 
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
     let (event_tx, mut event_rx) = mpsc::channel(32);
-    let (sync_req_tx, sync_req_rx) = mpsc::channel(32);
+    let (_sync_req_tx, sync_req_rx) = mpsc::channel(32);
 
     let mut p2p = AxionP2P::new(
         "axion-mainnet",
@@ -136,7 +144,7 @@ async fn handle_start() -> Result<()> {
         state.clone(),
     )
     .await
-    .map_err(|e| anyhow!("P2P Layer Initialization Failed: {}", e))?;
+    .map_err(|e| anyhow!("P2P Initialization failed: {}", e))?;
 
     tokio::spawn(async move {
         p2p.run().await;
@@ -148,7 +156,6 @@ async fn handle_start() -> Result<()> {
         did,
         sign_keys,
         enc_keys,
-        sync_req_tx,
     });
 
     let routes = build_routes(ctx);
@@ -184,6 +191,8 @@ fn build_routes(
         .allow_methods(vec![Method::GET, Method::POST])
         .allow_headers(vec!["content-type"]);
 
+    let explorer = warp::path("explorer.html").and(warp::fs::file("./explorer.html"));
+
     let publish = warp::path("publish")
         .and(warp::post())
         .and(warp::body::json())
@@ -199,7 +208,6 @@ fn build_routes(
                     {
                         let mut keys = std::collections::HashMap::new();
                         keys.insert(target.to_string(), (kem, nonce));
-
                         let payload = BlockPayload::DataStore {
                             policy: AccessPolicy::Private {
                                 recipient: target.into(),
@@ -211,11 +219,82 @@ fn build_routes(
                         return warp::reply::json(&"Published");
                     }
                 }
-                warp::reply::json(&"Error: Recipient not found or encryption failed")
+                warp::reply::json(&"Error: Encryption Failed")
             }
         });
 
-    publish.with(cors)
+    let announce = warp::path("announce_key")
+        .and(warp::post())
+        .and(warp::body::json())
+        .map({
+            let ctx = ctx.clone();
+            move |req: AnnounceRequest| {
+                let target_did = req.did.unwrap_or(ctx.did.clone());
+                let key = if let Some(k) = req.encryption_key {
+                    hex::decode(k).unwrap_or_default()
+                } else {
+                    ctx.enc_keys.public.clone()
+                };
+                let payload = BlockPayload::IdentityUpdate {
+                    did: target_did,
+                    new_encryption_key: key,
+                };
+                let _ = submit_block_sync(&ctx, payload);
+                warp::reply::json(&"Key Announced")
+            }
+        });
+
+    let public_query = warp::path!("api" / "blocks")
+        .and(warp::get())
+        .and(warp::query::<BlockQuery>())
+        .map({
+            let ctx = ctx.clone();
+            move |q: BlockQuery| {
+                let limit = q.limit.unwrap_or(50).min(500);
+                let offset = q.offset.unwrap_or(0);
+
+                let blocks = ctx
+                    .state
+                    .get_recent_blocks(limit * 2 + offset)
+                    .unwrap_or_default();
+
+                let filtered: Vec<AxionBlock> = blocks
+                    .into_iter()
+                    .filter(|b| {
+                        let mut keep = true;
+                        if let Some(auth) = &q.author {
+                            if &b.author_did != auth {
+                                keep = false;
+                            }
+                        }
+                        if let Some(rcpt) = &q.recipient {
+                            match &b.payload {
+                                BlockPayload::DataStore { policy, .. } => match policy {
+                                    AccessPolicy::Private { recipient } => {
+                                        if recipient != rcpt {
+                                            keep = false;
+                                        }
+                                    }
+                                    _ => keep = false,
+                                },
+                                _ => keep = false,
+                            }
+                        }
+                        keep
+                    })
+                    .skip(offset)
+                    .take(limit)
+                    .collect();
+
+                warp::reply::json(&filtered)
+            }
+        });
+
+    explorer
+        .or(publish)
+        .or(announce)
+        .or(public_query)
+        .with(cors)
 }
 
 fn submit_block_sync(ctx: &NodeContext, payload: BlockPayload) -> Result<()> {
@@ -225,7 +304,6 @@ fn submit_block_sync(ctx: &NodeContext, payload: BlockPayload) -> Result<()> {
     } else {
         0
     };
-
     let block = create_block(
         prev_idx + 1,
         vec![parent],
@@ -233,14 +311,11 @@ fn submit_block_sync(ctx: &NodeContext, payload: BlockPayload) -> Result<()> {
         &ctx.did,
         payload,
     )?;
-
     ctx.state.process_block(&block)?;
-
     let tx = ctx.cmd_tx.clone();
     tokio::spawn(async move {
         let _ = tx.send(block).await;
     });
-
     Ok(())
 }
 
@@ -284,5 +359,6 @@ fn load_or_create_identity(path: &str) -> Result<(Keypair, EncryptionKeypair, St
             pow,
         })?,
     )?;
+
     Ok((s, e, did))
 }
