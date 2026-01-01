@@ -6,6 +6,12 @@ use sled::Tree;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const MIN_RW_TO_PUBLISH: u64 = 50;
+const PROOF_BASE_REWARD: u64 = 10;
+const SLASH_PENALTY: u64 = 5000;
+const CHUNK_SIZE: usize = 1024;
+const REPLICATION_TARGET: usize = 8;
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum AccessPolicy {
     Public,
@@ -18,19 +24,28 @@ pub enum BlockPayload {
     Genesis {
         message: String,
     },
+    CapacityAnnouncement {
+        capacity_bytes: u64,
+    },
     DataStore {
         policy: AccessPolicy,
         blob: Vec<u8>,
         keys: HashMap<String, (Vec<u8>, Vec<u8>)>,
+        merkle_root: String,
+    },
+    CustodyProof {
+        challenge_block_hash: String,
+        chunk_index: usize,
+        chunk_data: Vec<u8>,
+        merkle_path: Vec<String>,
     },
     IdentityUpdate {
         did: String,
         new_encryption_key: Vec<u8>,
     },
-    FraudProof {
+    SlashingReport {
         accused_did: String,
-        blob_hash: String,
-        witness_votes: Vec<(String, Vec<u8>)>,
+        reason: String,
     },
 }
 
@@ -38,20 +53,9 @@ impl BlockPayload {
     pub fn get_keys_for(&self, did: &str) -> Result<(Vec<u8>, Vec<u8>)> {
         if let BlockPayload::DataStore { keys, .. } = self {
             let raw_did = did.replace("did:axion:", "");
-            let full_did = if !did.starts_with("did:axion:") {
-                format!("did:axion:{}", did)
-            } else {
-                did.to_string()
-            };
-
-            if let Some(k) = keys
-                .get(did)
-                .or_else(|| keys.get(&raw_did))
-                .or_else(|| keys.get(&full_did))
-            {
+            if let Some(k) = keys.get(did).or_else(|| keys.get(&raw_did)) {
                 return Ok(k.clone());
             }
-
             Err(anyhow!("Access Denied: No keys found for DID: {}", did))
         } else {
             Err(anyhow!("Not a DataStore block"))
@@ -123,25 +127,20 @@ impl AxionBlock {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct StoredBlock {
-    pub block: AxionBlock,
-    pub blob_hash: Option<String>,
-    pub cumulative_reputation: u128,
+#[derive(Serialize, Deserialize, Clone)]
+struct StoredBlock {
+    block: AxionBlock,
+    blob_hash: Option<String>,
+    cumulative_reputation: u128,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ValidatorState {
-    pub reputation: u64,
+    pub rw: u64,
     pub last_seen: u64,
-    pub signing_key: Vec<u8>,
     pub encryption_key: Vec<u8>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ValidatorSummary {
-    pub did: String,
-    pub state: ValidatorState,
+    pub storage_capacity: u64,
+    pub proved_shards: u64,
 }
 
 pub struct GlobalState {
@@ -153,8 +152,6 @@ pub struct GlobalState {
 }
 
 impl GlobalState {
-    const INITIAL_REPUTATION: u64 = 1_000_000;
-
     pub fn load(path: &str) -> Result<Self> {
         let db = sled::open(path).context("DB Open Failed")?;
         Ok(Self {
@@ -169,10 +166,7 @@ impl GlobalState {
     pub fn get_canonical_head(&self) -> Result<String> {
         match self.metadata.get("head_hash")? {
             Some(b) => Ok(String::from_utf8(b.to_vec())?),
-            None => match self.metadata.get("genesis_hash")? {
-                Some(b) => Ok(String::from_utf8(b.to_vec())?),
-                None => Ok(String::new()),
-            },
+            None => Ok(String::new()),
         }
     }
 
@@ -181,241 +175,239 @@ impl GlobalState {
             return Ok(());
         }
 
-        let mut author_val = self
-            .get_validator(&block.author_did)?
-            .unwrap_or(ValidatorState {
-                reputation: 0,
-                last_seen: block.timestamp,
-                signing_key: block.author_public_key.clone(),
-                encryption_key: vec![],
-            });
-
-        let mut parent_weight = 0u128;
-        if let Some(parent_hash) = block.parent_hashes.first() {
-            if let Some(parent_store) = self.get_stored_block_internal(parent_hash)? {
-                parent_weight = parent_store.cumulative_reputation;
-            }
-        }
-
-        let block_weight = parent_weight + (author_val.reputation as u128);
-
-        author_val.reputation += 10;
-        author_val.last_seen = block.timestamp;
+        let mut author = self.get_validator(&block.author_did)?.unwrap_or(ValidatorState {
+            rw: 0,
+            last_seen: block.timestamp,
+            encryption_key: vec![],
+            storage_capacity: 0,
+            proved_shards: 0,
+        });
 
         match &block.payload {
-            BlockPayload::IdentityUpdate {
-                did,
-                new_encryption_key,
-            } => {
-                let mut target_val = self.get_validator(did)?.unwrap_or(ValidatorState {
-                    reputation: 50,
-                    last_seen: block.timestamp,
-                    signing_key: vec![],
-                    encryption_key: vec![],
-                });
-                target_val.encryption_key = new_encryption_key.clone();
-                self.save_validator(did, target_val)?;
-            }
-            BlockPayload::FraudProof { accused_did, .. } => {
-                if let Some(mut bad) = self.get_validator(accused_did)? {
-                    bad.reputation /= 2;
-                    self.save_validator(accused_did, bad)?;
+            BlockPayload::CapacityAnnouncement { capacity_bytes } => {
+                author.storage_capacity = *capacity_bytes;
+            },
+
+            BlockPayload::DataStore { merkle_root, blob, .. } => {
+                if author.rw < MIN_RW_TO_PUBLISH {
+                    return Err(anyhow!("⛔ INSUFFICIENT RW: Need {} to publish.", MIN_RW_TO_PUBLISH));
                 }
-            }
+
+                if !blob.is_empty() {
+                    let calculated_root = calculate_merkle_root(blob);
+                    if &calculated_root != merkle_root {
+                         return Err(anyhow!("⛔ INVALID MERKLE ROOT: Data corruption detected."));
+                    }
+                }
+            },
+
+            BlockPayload::CustodyProof { challenge_block_hash, chunk_index, chunk_data, merkle_path } => {
+                let target_block_opt = self.get_block(challenge_block_hash)?;
+
+                if let Some(target_block) = target_block_opt {
+                    if let BlockPayload::DataStore { merkle_root, .. } = &target_block.payload {
+                        if verify_merkle_proof(chunk_data, *chunk_index, merkle_path, merkle_root) {
+
+                            if self.is_node_responsible_for_shard(&block.author_did, challenge_block_hash) {
+                                let cap_factor = (author.storage_capacity as f64).log2().max(1.0) as u64;
+                                let reward = PROOF_BASE_REWARD * cap_factor;
+
+                                author.rw += reward;
+                                author.proved_shards += 1;
+                            } else {
+                                author.rw += 1;
+                            }
+                        } else {
+                            author.rw = author.rw.saturating_sub(SLASH_PENALTY);
+                        }
+                    }
+                } else {
+                    author.rw = author.rw.saturating_sub(10);
+                }
+            },
+
+            BlockPayload::SlashingReport { accused_did, .. } => {
+                if let Some(mut bad) = self.get_validator(accused_did)? {
+                    bad.rw = bad.rw.saturating_sub(SLASH_PENALTY);
+                    bad.proved_shards = 0;
+                    self.save_validator(accused_did, bad)?;
+                    author.rw += 50;
+                }
+            },
+
+            BlockPayload::IdentityUpdate { did, new_encryption_key } => {
+                 let mut t = self.get_validator(did)?.unwrap_or(ValidatorState {
+                    rw: 0, last_seen: 0, encryption_key: vec![], storage_capacity: 0, proved_shards: 0
+                 });
+                 t.encryption_key = new_encryption_key.clone();
+                 self.save_validator(did, t)?;
+            },
+
             _ => {}
         }
 
-        self.save_validator(&block.author_did, author_val)?;
-        self.save_block_internal(block, block_weight)?;
+        author.last_seen = block.timestamp;
+        self.save_validator(&block.author_did, author.clone())?;
 
-        self.update_head_if_heavier(block.hash.clone(), block_weight)?;
+        let mut parent_weight = 0u128;
+        if let Some(p) = block.parent_hashes.first() {
+            if let Some(sb) = self.get_stored_block_internal(p)? {
+                parent_weight = sb.cumulative_reputation;
+            }
+        }
+        let new_weight = parent_weight + (author.rw as u128);
+
+        self.save_block_internal(block, new_weight)?;
+        self.update_head_if_heavier(block.hash.clone(), new_weight)?;
 
         Ok(())
     }
 
+    fn is_node_responsible_for_shard(&self, did: &str, block_hash: &str) -> bool {
+        let node_hash = Sha3_256::digest(did.as_bytes());
+        let content_hash = hex::decode(block_hash).unwrap_or(vec![0u8; 32]);
+
+        let distance = xor_distance(&node_hash, &content_hash);
+
+        // radius = MaxDistance / NumNodes.
+        distance[0] < 32
+    }
+
     fn update_head_if_heavier(&self, new_hash: String, new_weight: u128) -> Result<()> {
         let current_max_bytes = self.metadata.get("max_reputation")?.unwrap_or_default();
-        let current_max = if current_max_bytes.is_empty() {
-            0
-        } else {
-            let arr: [u8; 16] = current_max_bytes.as_ref().try_into().unwrap_or([0; 16]);
-            u128::from_be_bytes(arr)
+        let current_max = if current_max_bytes.is_empty() { 0 } else {
+             let arr: [u8; 16] = current_max_bytes.as_ref().try_into().unwrap_or([0; 16]);
+             u128::from_be_bytes(arr)
         };
-
         if new_weight > current_max {
-            self.metadata
-                .insert("max_reputation", &new_weight.to_be_bytes())?;
+            self.metadata.insert("max_reputation", &new_weight.to_be_bytes())?;
             self.metadata.insert("head_hash", new_hash.as_bytes())?;
-            self.metadata.flush()?;
         }
         Ok(())
     }
 
     fn save_block_internal(&self, block: &AxionBlock, weight: u128) -> Result<()> {
-        let mut skeleton_block = block.clone();
+        let mut skeleton = block.clone();
         let mut extracted_hash = None;
-
-        if let BlockPayload::DataStore { blob, .. } = &mut skeleton_block.payload {
+        if let BlockPayload::DataStore { blob, .. } = &mut skeleton.payload {
             if !blob.is_empty() {
-                let mut hasher = Sha3_256::new();
-                hasher.update(&blob);
-                let blob_hash = hex::encode(hasher.finalize());
-                self.cas.insert(&blob_hash, blob.as_slice())?;
+                let mut h = Sha3_256::new(); h.update(&blob);
+                let bh = hex::encode(h.finalize());
+                self.cas.insert(&bh, blob.as_slice())?;
                 *blob = Vec::new();
-                extracted_hash = Some(blob_hash);
+                extracted_hash = Some(bh);
             }
         }
+        let stored = StoredBlock { block: skeleton, blob_hash: extracted_hash, cumulative_reputation: weight };
+        self.blocks.insert(&block.hash, bincode::serialize(&stored)?)?;
 
-        let storage_unit = StoredBlock {
-            block: skeleton_block,
-            blob_hash: extracted_hash,
-            cumulative_reputation: weight,
-        };
-        let bytes = bincode::serialize(&storage_unit)?;
-        self.blocks.insert(&block.hash, bytes)?;
+        let h_key = block.index.to_be_bytes();
+        let mut hashes: Vec<String> = self.heights.get(&h_key)?.map(|v| bincode::deserialize(&v).unwrap()).unwrap_or_default();
+        if !hashes.contains(&block.hash) { hashes.push(block.hash.clone()); }
+        self.heights.insert(&h_key, bincode::serialize(&hashes)?)?;
 
-        let height_key = block.index.to_be_bytes();
-        let mut hashes_at_height: Vec<String> = match self.heights.get(&height_key)? {
-            Some(data) => bincode::deserialize(&data).unwrap_or_default(),
-            None => Vec::new(),
-        };
-
-        if !hashes_at_height.contains(&block.hash) {
-            hashes_at_height.push(block.hash.clone());
-            self.heights
-                .insert(&height_key, bincode::serialize(&hashes_at_height)?)?;
-        }
-
-        self.blocks.flush()?;
-        self.heights.flush()?;
-        self.cas.flush()?;
         Ok(())
     }
 
     pub fn get_block(&self, hash: &str) -> Result<Option<AxionBlock>> {
         if let Some(stored) = self.get_stored_block_internal(hash)? {
-            let mut full_block = stored.block;
+            let mut full = stored.block;
             if let Some(bh) = stored.blob_hash {
-                if let Some(blob_bytes) = self.cas.get(&bh)? {
-                    if let BlockPayload::DataStore { blob, .. } = &mut full_block.payload {
-                        *blob = blob_bytes.to_vec();
+                if let Some(blob) = self.cas.get(&bh)? {
+                    if let BlockPayload::DataStore { blob: b_target, .. } = &mut full.payload {
+                        *b_target = blob.to_vec();
                     }
                 }
             }
-            Ok(Some(full_block))
-        } else {
-            Ok(None)
-        }
+            Ok(Some(full))
+        } else { Ok(None) }
     }
 
     fn get_stored_block_internal(&self, hash: &str) -> Result<Option<StoredBlock>> {
         match self.blocks.get(hash)? {
-            Some(bytes) => Ok(Some(bincode::deserialize(&bytes)?)),
-            None => Ok(None),
+            Some(b) => Ok(Some(bincode::deserialize(&b)?)),
+            None => Ok(None)
         }
     }
 
-    pub fn apply_genesis(&self, block: &AxionBlock) -> Result<()> {
-        if self.blocks.contains_key(&block.hash)? {
-            return Ok(());
+    pub fn get_validator(&self, did: &str) -> Result<Option<ValidatorState>> {
+        match self.validators.get(did)? {
+            Some(b) => Ok(Some(bincode::deserialize(&b)?)),
+            None => Ok(None)
         }
+    }
 
-        self.save_block_internal(block, 1_000_000)?;
+    fn save_validator(&self, did: &str, val: ValidatorState) -> Result<()> {
+        self.validators.insert(did, bincode::serialize(&val)?)?;
+        Ok(())
+    }
 
-        self.metadata
-            .insert("genesis_hash", block.hash.as_bytes())?;
+    pub fn apply_genesis(&self, block: &AxionBlock) -> Result<()> {
+        self.save_block_internal(block, 1000)?;
+        self.metadata.insert("genesis_hash", block.hash.as_bytes())?;
         self.metadata.insert("head_hash", block.hash.as_bytes())?;
-        self.metadata
-            .insert("max_reputation", &1_000_000u128.to_be_bytes())?;
-
         let val = ValidatorState {
-            reputation: Self::INITIAL_REPUTATION,
-            last_seen: block.timestamp,
-            signing_key: block.author_public_key.clone(),
-            encryption_key: vec![],
+            rw: 1000, last_seen: block.timestamp, encryption_key: vec![],
+            storage_capacity: 1024 * 1024 * 1024,
+            proved_shards: 0
         };
         self.save_validator(&block.author_did, val)?;
         Ok(())
     }
 
-    pub fn get_validator(&self, did: &str) -> Result<Option<ValidatorState>> {
-        match self.validators.get(did)? {
-            Some(b) => Ok(Some(bincode::deserialize::<ValidatorState>(&b)?)),
-            None => Ok(None),
-        }
-    }
-
-    fn save_validator(&self, did: &str, state: ValidatorState) -> Result<()> {
-        let bytes = bincode::serialize(&state)?;
-        self.validators.insert(did, bytes)?;
-        Ok(())
-    }
-
     pub fn get_recent_blocks(&self, limit: usize) -> Result<Vec<AxionBlock>> {
-        let mut result = Vec::new();
-        for item in self.heights.iter().rev() {
-            let (_, value) = item?;
-            let hashes: Vec<String> = bincode::deserialize(&value)?;
-            for hash in hashes {
-                if let Some(block) = self.get_block(&hash)? {
-                    result.push(block);
-                    if result.len() >= limit {
-                        return Ok(result);
-                    }
-                }
-            }
-        }
-        Ok(result)
+         let mut res = Vec::new();
+         for item in self.heights.iter().rev() {
+             let (_, v) = item?;
+             let hashes: Vec<String> = bincode::deserialize(&v)?;
+             for h in hashes { if let Some(b) = self.get_block(&h)? { res.push(b); } }
+             if res.len() >= limit { break; }
+         }
+         Ok(res)
     }
+}
 
-    pub fn get_stats(&self) -> Result<(usize, usize, usize)> {
-        Ok((self.blocks.len(), self.validators.len(), self.cas.len()))
-    }
+fn calculate_merkle_root(blob: &[u8]) -> String {
+    let chunks: Vec<&[u8]> = blob.chunks(CHUNK_SIZE).collect();
+    if chunks.is_empty() { return String::new(); }
 
-    pub fn get_blocks_range(&self, start: u64, limit: usize) -> Result<Vec<AxionBlock>> {
-        let mut res = Vec::new();
-        for i in start..(start + limit as u64) {
-            if let Some(bs) = self.heights.get(&i.to_be_bytes())? {
-                let hashes: Vec<String> = bincode::deserialize(&bs)?;
-                for h in hashes {
-                    if let Some(b) = self.get_block(&h)? {
-                        res.push(b);
-                    }
-                }
-            }
-        }
-        Ok(res)
-    }
+    let mut nodes: Vec<String> = chunks.iter().map(|c| {
+        let mut h = Sha3_256::new(); h.update(c);
+        hex::encode(h.finalize())
+    }).collect();
 
-    pub fn prune_stale_data(&self, retention_seconds: u64) -> Result<usize> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let cutoff = now.saturating_sub(retention_seconds);
-        let mut count = 0;
-        for item in self.blocks.iter() {
-            let (k, v) = item?;
-            if let Ok(sb) = bincode::deserialize::<StoredBlock>(&v) {
-                if sb.block.index != 0 && sb.block.timestamp < cutoff {
-                    self.blocks.remove(&k)?;
-                    if let Some(bh) = sb.blob_hash {
-                        self.cas.remove(bh)?;
-                    }
-                    count += 1;
-                }
-            }
+    while nodes.len() > 1 {
+        let mut next_level = Vec::new();
+        for i in (0..nodes.len()).step_by(2) {
+            let left = &nodes[i];
+            let right = if i + 1 < nodes.len() { &nodes[i + 1] } else { left };
+            let mut h = Sha3_256::new();
+            h.update(left); h.update(right);
+            next_level.push(hex::encode(h.finalize()));
         }
-        Ok(count)
+        nodes = next_level;
     }
+    nodes[0].clone()
+}
 
-    pub fn get_top_validators(&self, count: usize) -> Result<Vec<(String, ValidatorState)>> {
-        let mut validators = Vec::new();
-        for item in self.validators.iter() {
-            let (did_bytes, val_bytes) = item?;
-            let did = String::from_utf8(did_bytes.to_vec())?;
-            let val: ValidatorState = bincode::deserialize(&val_bytes)?;
-            validators.push((did, val));
+fn verify_merkle_proof(chunk: &[u8], index: usize, path: &[String], root: &str) -> bool {
+    let mut h = Sha3_256::new(); h.update(chunk);
+    let mut current_hash = hex::encode(h.finalize());
+    let mut idx = index;
+
+    for sibling in path {
+        let mut h = Sha3_256::new();
+        if idx % 2 == 0 {
+            h.update(&current_hash); h.update(sibling);
+        } else {
+            h.update(sibling); h.update(&current_hash);
         }
-        validators.sort_by(|a, b| b.1.reputation.cmp(&a.1.reputation));
-        validators.truncate(count);
-        Ok(validators)
+        current_hash = hex::encode(h.finalize());
+        idx /= 2;
     }
+    current_hash == root
+}
+
+fn xor_distance(a: &[u8], b: &[u8]) -> Vec<u8> {
+    a.iter().zip(b.iter()).map(|(x, y)| x ^ y).collect()
 }
